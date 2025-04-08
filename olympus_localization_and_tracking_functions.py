@@ -224,16 +224,16 @@ def add_mean_position_cols(df):
                 df[f"({number}) mean y position"] = df[y_col].apply(compute_mean_position)
 
 # Function to add mean position columns for X and Y
-def add_mean_corrected_position_cols(df):
+def add_mean_ff_corrected_position_cols(df):
     """Adds mean position columns for X and Y."""
     for col in df.columns:
-        match = re.match(r"\((\d+)\) x positions corrected", col)  # Match X position columns
+        match = re.match(r"\((\d+)\) x positions ff corrected", col)  # Match X position columns
         if match:
             number = match.group(1)
-            y_col = f"({number}) y positions corrected"
+            y_col = f"({number}) y positions ff corrected"
             if y_col in df.columns:  # Ensure Y column exists
-                df[f"({number}) mean x position corrected"] = df[col].apply(compute_mean_position)
-                df[f"({number}) mean y position corrected"] = df[y_col].apply(compute_mean_position)
+                df[f"({number}) mean x position ff corrected"] = df[col].apply(compute_mean_position)
+                df[f"({number}) mean y position ff corrected"] = df[y_col].apply(compute_mean_position)
 
 
 # Updated function to compute standard deviation for separate X and Y columns
@@ -255,168 +255,166 @@ def add_stdev_position_cols(df):
                 df[f"({number}) stdev y position"] = df[y_col].apply(compute_stdev_position)
 
 
-def add_stdev_corrected_position_cols(df):
+def add_stdev_ff_corrected_position_cols(df):
     """Adds standard deviation position columns for X and Y."""
     for col in df.columns:
-        match = re.match(r"\((\d+)\) x positions corrected", col)  # Match X position columns
+        match = re.match(r"\((\d+)\) x positions ff corrected", col)  # Match X position columns
         if match:
             number = match.group(1)
-            y_col = f"({number}) y positions corrected"
+            y_col = f"({number}) y positions ff corrected"
             if y_col in df.columns:  # Ensure Y column exists
-                df[f"({number}) stdev x position corrected"] = df[col].apply(compute_stdev_position)
-                df[f"({number}) stdev y position corrected"] = df[y_col].apply(compute_stdev_position)
+                df[f"({number}) stdev x position ff corrected"] = df[col].apply(compute_stdev_position)
+                df[f"({number}) stdev y position ff corrected"] = df[y_col].apply(compute_stdev_position)
 
 
-def compute_msd_from_trajectory(xy_data: np.ndarray, time_step: float, pixel_size: float):
-    """
-    Compute Mean Squared Displacement (MSD) from an array of [x, y] positions over time.
+# def compute_msd_from_trajectory(xy_data: np.ndarray, time_step: float, pixel_size: float):
+#     """
+#     Compute Mean Squared Displacement (MSD) from an array of [x, y] positions over time.
+#
+#     Parameters:
+#     - xy_data: A NumPy array of shape (N, 2), where N is the number of time steps.
+#     - time_step: Time interval between frames (in seconds).
+#     - pixel_size: Size of a pixel (in micrometers).
+#
+#     Returns:
+#     - time_lags: NumPy array of time lags (in seconds).
+#     - msd: NumPy array of mean squared displacements (in µm²).
+#     """
+#     if len(xy_data) < 2:
+#         return np.array([]), np.array([])  # Not enough data to compute MSD
+#
+#     # Convert positions to micrometers
+#     x = xy_data[:, 0] * pixel_size
+#     y = xy_data[:, 1] * pixel_size
+#     N = len(x)
+#
+#     msd = []
+#     time_lags = []
+#
+#     for lag in range(1, N // 2):  # Use up to half the trajectory to avoid noise
+#         displacements = (x[lag:] - x[:-lag]) ** 2 + (y[lag:] - y[:-lag]) ** 2
+#         msd.append(np.mean(displacements))
+#         time_lags.append(lag * time_step)  # Calculate the time difference for each lag
+#
+#     return np.array(time_lags), np.array(msd)
 
-    Parameters:
-    - xy_data: A NumPy array of shape (N, 2), where N is the number of time steps.
-    - time_step: Time interval between frames (in seconds).
-    - pixel_size: Size of a pixel (in micrometers).
+# def fit_diffusion_coefficient(time_lags: np.ndarray, msd_values: np.ndarray):
+#     """
+#     Fit the MSD to extract the diffusion coefficient (D).
+#
+#     Parameters:
+#     - time_lags: NumPy array of time lags (in seconds).
+#     - msd_values: NumPy array of mean squared displacements (in µm²).
+#
+#     Returns:
+#     - D: Diffusion coefficient (in µm²/s).
+#     """
+#     if len(time_lags) < 2:
+#         raise ValueError("Insufficient data to fit diffusion coefficient.")
+#
+#     def linear_fit(tau, D):
+#         return 4 * D * tau  # Linear relationship for MSD vs time lag
+#
+#     popt, _ = curve_fit(linear_fit, time_lags, msd_values)
+#     D = popt[0]
+#     return D
 
-    Returns:
-    - time_lags: NumPy array of time lags (in seconds).
-    - msd: NumPy array of mean squared displacements (in µm²).
-    """
-    if len(xy_data) < 2:
-        return np.array([]), np.array([])  # Not enough data to compute MSD
+# def add_diffusion_coefficient_cols(df, time_step, magnification):
+#     """
+#     Adds diffusion coefficient (D) columns to the DataFrame for each row (particle) based on its (x, y) positions.
+#
+#     Parameters:
+#     - df: Pandas DataFrame containing particle tracking data.
+#     - time_step: Time interval between frames (in seconds).
+#     - pixel_size: Size of a pixel in micrometers (µm).
+#
+#     Adds a new column named "(number) D" for each particle.
+#     """
+#     if magnification == 10:
+#         pixel_size = 0.650  # um
+#     elif magnification == 20:
+#         pixel_size = 0.325  # um
+#     else:
+#         print("error: magnification not properly specified!")
+#         return
+#
+#     for col in df.columns:
+#         match = re.match(r"\((\d+)\) x positions", col)  # Match X position columns
+#         if match:
+#             number = match.group(1)
+#             y_col = f"({number}) y positions"
+#             if y_col in df.columns:  # Ensure corresponding Y column exists
+#                 D_col_title = f"({number}) D"
+#                 df[D_col_title] = np.nan  # Initialize the new column with NaN values
+#
+#                 for index, row in df.iterrows():
+#                     x_positions = row[col]
+#                     y_positions = row[y_col]
+#
+#                     # Ensure x_positions and y_positions are numpy arrays with enough data
+#                     if isinstance(x_positions, np.ndarray) and isinstance(y_positions, np.ndarray):
+#                         if len(x_positions) > 2 and len(y_positions) > 2:
+#                             xy_data = np.column_stack((x_positions, y_positions))  # Combine x and y into a 2D array
+#                             time_lags, msd_values = compute_msd_from_trajectory(xy_data, time_step, pixel_size)
+#
+#                             if len(time_lags) > 1 and len(msd_values) > 1:
+#                                 try:
+#                                     D = fit_diffusion_coefficient(time_lags, msd_values)
+#                                     df.at[index, D_col_title] = D  # Assign the computed D to the new column
+#                                 except (RuntimeError, ValueError) as e:
+#                                     print(f"Fit failed for particle at index {index}: {e}")
 
-    # Convert positions to micrometers
-    x = xy_data[:, 0] * pixel_size
-    y = xy_data[:, 1] * pixel_size
-    N = len(x)
+# def add_diffusion_coefficient_corrected_cols(df, time_step, magnification):
+#     """
+#     Adds diffusion coefficient (D) columns to the DataFrame for each row (particle) based on its (x, y) positions.
+#
+#     Parameters:
+#     - df: Pandas DataFrame containing particle tracking data.
+#     - time_step: Time interval between frames (in seconds).
+#     - pixel_size: Size of a pixel in micrometers (µm).
+#
+#     Adds a new column named "(number) D" for each particle.
+#     """
+#     if magnification == 10:
+#         pixel_size = 0.650  # um
+#     elif magnification == 20:
+#         pixel_size = 0.325  # um
+#     else:
+#         print("error: magnification not properly specified!")
+#         return
+#
+#     for col in df.columns:
+#         match = re.match(r"\((\d+)\) x positions corrected", col)  # Match X position columns
+#         if match:
+#             number = match.group(1)
+#             y_col = f"({number}) y positions corrected"
+#             if y_col in df.columns:  # Ensure corresponding Y column exists
+#                 D_col_title = f"({number}) D"
+#                 df[D_col_title] = np.nan  # Initialize the new column with NaN values
+#
+#                 for index, row in df.iterrows():
+#                     x_positions = row[col]
+#                     y_positions = row[y_col]
+#
+#                     # Ensure x_positions and y_positions are numpy arrays with enough data
+#                     if isinstance(x_positions, np.ndarray) and isinstance(y_positions, np.ndarray):
+#                         if len(x_positions) > 2 and len(y_positions) > 2:
+#                             xy_data = np.column_stack((x_positions, y_positions))  # Combine x and y into a 2D array
+#                             time_lags, msd_values = compute_msd_from_trajectory(xy_data, time_step, pixel_size)
+#
+#                             if len(time_lags) > 1 and len(msd_values) > 1:
+#                                 try:
+#                                     D = fit_diffusion_coefficient(time_lags, msd_values)
+#                                     df.at[index, D_col_title] = D  # Assign the computed D to the new column
+#                                 except (RuntimeError, ValueError) as e:
+#                                     print(f"Fit failed for particle at index {index}: {e}")
+#
 
-    msd = []
-    time_lags = []
-
-    for lag in range(1, N // 2):  # Use up to half the trajectory to avoid noise
-        displacements = (x[lag:] - x[:-lag]) ** 2 + (y[lag:] - y[:-lag]) ** 2
-        msd.append(np.mean(displacements))
-        time_lags.append(lag * time_step)  # Calculate the time difference for each lag
-
-    return np.array(time_lags), np.array(msd)
-
-def fit_diffusion_coefficient(time_lags: np.ndarray, msd_values: np.ndarray):
-    """
-    Fit the MSD to extract the diffusion coefficient (D).
-
-    Parameters:
-    - time_lags: NumPy array of time lags (in seconds).
-    - msd_values: NumPy array of mean squared displacements (in µm²).
-
-    Returns:
-    - D: Diffusion coefficient (in µm²/s).
-    """
-    if len(time_lags) < 2:
-        raise ValueError("Insufficient data to fit diffusion coefficient.")
-
-    def linear_fit(tau, D):
-        return 4 * D * tau  # Linear relationship for MSD vs time lag
-
-    popt, _ = curve_fit(linear_fit, time_lags, msd_values)
-    D = popt[0]
-    return D
-
-def add_diffusion_coefficient_cols(df, time_step, magnification):
-    """
-    Adds diffusion coefficient (D) columns to the DataFrame for each row (particle) based on its (x, y) positions.
-
-    Parameters:
-    - df: Pandas DataFrame containing particle tracking data.
-    - time_step: Time interval between frames (in seconds).
-    - pixel_size: Size of a pixel in micrometers (µm).
-
-    Adds a new column named "(number) D" for each particle.
-    """
-    if magnification == 10:
-        pixel_size = 0.650  # um
-    elif magnification == 20:
-        pixel_size = 0.325  # um
-    else:
-        print("error: magnification not properly specified!")
-        return
-
-    for col in df.columns:
-        match = re.match(r"\((\d+)\) x positions", col)  # Match X position columns
-        if match:
-            number = match.group(1)
-            y_col = f"({number}) y positions"
-            if y_col in df.columns:  # Ensure corresponding Y column exists
-                D_col_title = f"({number}) D"
-                df[D_col_title] = np.nan  # Initialize the new column with NaN values
-
-                for index, row in df.iterrows():
-                    x_positions = row[col]
-                    y_positions = row[y_col]
-
-                    # Ensure x_positions and y_positions are numpy arrays with enough data
-                    if isinstance(x_positions, np.ndarray) and isinstance(y_positions, np.ndarray):
-                        if len(x_positions) > 2 and len(y_positions) > 2:
-                            xy_data = np.column_stack((x_positions, y_positions))  # Combine x and y into a 2D array
-                            time_lags, msd_values = compute_msd_from_trajectory(xy_data, time_step, pixel_size)
-
-                            if len(time_lags) > 1 and len(msd_values) > 1:
-                                try:
-                                    D = fit_diffusion_coefficient(time_lags, msd_values)
-                                    df.at[index, D_col_title] = D  # Assign the computed D to the new column
-                                except (RuntimeError, ValueError) as e:
-                                    print(f"Fit failed for particle at index {index}: {e}")
-
-def add_diffusion_coefficient_corrected_cols(df, time_step, magnification):
-    """
-    Adds diffusion coefficient (D) columns to the DataFrame for each row (particle) based on its (x, y) positions.
-
-    Parameters:
-    - df: Pandas DataFrame containing particle tracking data.
-    - time_step: Time interval between frames (in seconds).
-    - pixel_size: Size of a pixel in micrometers (µm).
-
-    Adds a new column named "(number) D" for each particle.
-    """
-    if magnification == 10:
-        pixel_size = 0.650  # um
-    elif magnification == 20:
-        pixel_size = 0.325  # um
-    else:
-        print("error: magnification not properly specified!")
-        return
-
-    for col in df.columns:
-        match = re.match(r"\((\d+)\) x positions corrected", col)  # Match X position columns
-        if match:
-            number = match.group(1)
-            y_col = f"({number}) y positions corrected"
-            if y_col in df.columns:  # Ensure corresponding Y column exists
-                D_col_title = f"({number}) D"
-                df[D_col_title] = np.nan  # Initialize the new column with NaN values
-
-                for index, row in df.iterrows():
-                    x_positions = row[col]
-                    y_positions = row[y_col]
-
-                    # Ensure x_positions and y_positions are numpy arrays with enough data
-                    if isinstance(x_positions, np.ndarray) and isinstance(y_positions, np.ndarray):
-                        if len(x_positions) > 2 and len(y_positions) > 2:
-                            xy_data = np.column_stack((x_positions, y_positions))  # Combine x and y into a 2D array
-                            time_lags, msd_values = compute_msd_from_trajectory(xy_data, time_step, pixel_size)
-
-                            if len(time_lags) > 1 and len(msd_values) > 1:
-                                try:
-                                    D = fit_diffusion_coefficient(time_lags, msd_values)
-                                    df.at[index, D_col_title] = D  # Assign the computed D to the new column
-                                except (RuntimeError, ValueError) as e:
-                                    print(f"Fit failed for particle at index {index}: {e}")
-
-
-def add_corrected_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1):
-    x_col_ref = f"({ref_vid_num}) x positions"
-    y_col_ref = f"({ref_vid_num}) y positions"
+def add_frame_by_frame_corrected_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1):
     x_col = f"({vid_num}) x positions"
     y_col = f"({vid_num}) y positions"
-    x_col_corrected = f"({vid_num}) x positions corrected"
-    y_col_corrected = f"({vid_num}) y positions corrected"
+    x_col_corrected = f"({vid_num}) x positions ff corrected"
+    y_col_corrected = f"({vid_num}) y positions ff corrected"
 
     # Initialize empty lists for all corrected positions
     corrected_x_all = [[] for _ in range(len(particles_df))]
@@ -425,7 +423,7 @@ def add_corrected_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int
     particles_df.loc[:, x_col_corrected] = pd.Series([[] for _ in range(len(particles_df))], index=particles_df.index)
     particles_df.loc[:, y_col_corrected] = pd.Series([[] for _ in range(len(particles_df))], index=particles_df.index)
 
-    P1 = extract_mean_fiducial_positions(particles_df, x_col_ref, y_col_ref)
+    P1 = extract_mean_fiducial_positions(particles_df, vid_num=ref_vid_num)
 
     for i in range(len(particles_df[x_col].values[0])): # for every recorded timepoint in the video
         # extract the position of all fiducials in that frame
@@ -445,53 +443,61 @@ def add_corrected_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int
     particles_df[x_col_corrected] = corrected_x_all
     particles_df[y_col_corrected] = corrected_y_all
 
-# def add_double_corrected_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1):
-#     x_col_ref = f"({ref_vid_num}) x positions corrected"
-#     y_col_ref = f"({ref_vid_num}) y positions corrected"
-#     x_col = f"({vid_num}) x positions corrected"
-#     y_col = f"({vid_num}) y positions corrected"
-#     x_col_corrected = f"({vid_num}) x positions double corrected"
-#     y_col_corrected = f"({vid_num}) y positions double corrected"
-#
-#     # Initialize empty lists for all corrected positions
-#     corrected_x_all = [[] for _ in range(len(particles_df))]
-#     corrected_y_all = [[] for _ in range(len(particles_df))]
-#
-#     particles_df.loc[:, x_col_corrected] = pd.Series([[] for _ in range(len(particles_df))], index=particles_df.index)
-#     particles_df.loc[:, y_col_corrected] = pd.Series([[] for _ in range(len(particles_df))], index=particles_df.index)
-#
-#     # Identify unbound population
-#     y_shifts_corrected =
-#     P1 = extract_mean_fiducial_positions(particles_df, x_col_ref, y_col_ref)
-#
-#     for i in range(len(particles_df[x_col].values[0])): # for every recorded timepoint in the video
-#         # extract the position of all fiducials in that frame
-#         P2 = extract_fiducial_positions(particles_df, x_col, y_col, frame_index=i)
-#         # define A for rigid body transformation to correct for drift
-#         A = rigid_transform_least_squares(P1, P2)
-#         # extract the position of all beads in that frame
-#         P3 = extract_all_bead_positions(particles_df, x_col, y_col, frame_index=i)
-#         # perform rigid body transformation to correct for drift
-#         P3_corrected = apply_rigid_transform(A, P3)
-#
-#         for j in range(len(particles_df)):
-#             corrected_x_all[j].append(P3_corrected[0, j])
-#             corrected_y_all[j].append(P3_corrected[1, j])
-#
-#     # Assign full lists back to the DataFrame at once
-#     particles_df[x_col_corrected] = corrected_x_all
-#     particles_df[y_col_corrected] = corrected_y_all
+def add_video_average_corrected_mean_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1):
+    x_col_corrected = f"({vid_num}) mean x position va corrected"
+    y_col_corrected = f"({vid_num}) mean y position va corrected"
 
-def extract_mean_fiducial_positions(particles_df, x_col, y_col):
+    # Initialize nan cols for all corrected mean positions
+    # particles_df.loc[:, x_col_corrected] = np.nan
+    # particles_df.loc[:, y_col_corrected] = np.nan
+
+    # extract mean positons of all fiducials in reference video
+    P1 = extract_mean_fiducial_positions(particles_df, vid_num=ref_vid_num)
+
+    # extract the mean positions of all fiducial in the video
+    P2 = extract_mean_fiducial_positions(particles_df, vid_num=vid_num)
+
+    # define A for rigid body transformation to correct for drift
+    A = rigid_transform_least_squares(P1, P2)
+
+    # extract the position of all beads in the video
+    P3 = extract_mean_bead_positions(particles_df, vid_num=vid_num)
+
+    # perform rigid body transformation to correct for drift
+    P3_corrected = apply_rigid_transform(A, P3)
+
+    particles_df[x_col_corrected] = P3_corrected[0, :]  # First row → x values
+    particles_df[y_col_corrected] = P3_corrected[1, :]  # Second row → y values
+
+
+def extract_mean_fiducial_positions(particles_df, vid_num: int = 1):
     """
     Extracts fiducial positions for fiducial bead rows in particles dataframe
     """
+    x_col = f"({vid_num}) mean x position"
+    y_col = f"({vid_num}) mean y position"
     x_list, y_list = [], []
 
     fiducial_particles_df = particles_df[particles_df["Particle Number"] < 0]
     for index, row in fiducial_particles_df.iterrows():
-        x_list.append(np.mean(row[x_col]))
-        y_list.append(np.mean(row[y_col]))
+        x_list.append(row[x_col])
+        y_list.append(row[y_col])
+
+    P = np.array([x_list, y_list])  # shape 2×n
+
+    return P
+
+def extract_mean_bead_positions(particles_df, vid_num: int = 1):
+    """
+    Extracts bead positions for all beads rows in particles dataframe
+    """
+    x_col = f"({vid_num}) mean x position"
+    y_col = f"({vid_num}) mean y position"
+    x_list, y_list = [], []
+
+    for index, row in particles_df.iterrows():
+        x_list.append(row[x_col])
+        y_list.append(row[y_col])
 
     P = np.array([x_list, y_list])  # shape 2×n
 
@@ -577,14 +583,21 @@ def add_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
     df[f"({ref_vid_num}) to ({vid_num}) mean y position shift"] = df[y_col] - df[y_ref_col]
 
 
-def add_corrected_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
-    x_col = f"({vid_num}) mean x position corrected"
-    y_col = f"({vid_num}) mean y position corrected"
-    x_ref_col = f"({ref_vid_num}) mean x position corrected"
-    y_ref_col = f"({ref_vid_num}) mean y position corrected"
-    df[f"({ref_vid_num}) to ({vid_num}) corrected mean x position shift"] = df[x_col] - df[x_ref_col]
-    df[f"({ref_vid_num}) to ({vid_num}) corrected mean y position shift"] = df[y_col] - df[y_ref_col]
+def add_ff_corrected_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
+    x_col = f"({vid_num}) mean x position ff corrected"
+    y_col = f"({vid_num}) mean y position ff corrected"
+    x_ref_col = f"({ref_vid_num}) mean x position ff corrected"
+    y_ref_col = f"({ref_vid_num}) mean y position ff corrected"
+    df[f"({ref_vid_num}) to ({vid_num}) ff corrected mean x position shift"] = df[x_col] - df[x_ref_col]
+    df[f"({ref_vid_num}) to ({vid_num}) ff corrected mean y position shift"] = df[y_col] - df[y_ref_col]
 
+def add_va_corrected_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
+    x_col = f"({vid_num}) mean x position va corrected"
+    y_col = f"({vid_num}) mean y position va corrected"
+    x_ref_col = f"({ref_vid_num}) mean x position va corrected"
+    y_ref_col = f"({ref_vid_num}) mean y position va corrected"
+    df[f"({ref_vid_num}) to ({vid_num}) va corrected mean x position shift"] = df[x_col] - df[x_ref_col]
+    df[f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"] = df[y_col] - df[y_ref_col]
 
 def plot_single_particle_tracking(df, image_path, video_num, frame_number, particle_num):
     """
@@ -722,8 +735,6 @@ def plot_particles_tracking_on_frame(df, image_path, video_num, frame_number):
     plt.legend()
     plt.axis("off")
     plt.show()
-
-import matplotlib.pyplot as plt
 
 
 def plot_fiducials_across_videos(video_paths, particles_df):
@@ -1074,60 +1085,64 @@ def flat_field_correction(image_stack: np.ndarray, flat_field: np.ndarray):
 
     return corrected_stack
 
-import matplotlib.pyplot as plt
 
-def plot_position_shift_histograms(df, ref_vid_num: int = 1, vid_num: int=2, bin_range=(-1, 1), fid_bin_range = (-0.5, 0.5), bins=100, fid_bins = 50):
+def plot_mean_position_shift_histograms(df, correction: str, ref_vid_num: int = 1, vid_num: int=2, bin_range=(-1, 1), fid_bin_range = (-0.5, 0.5), bins=100, fid_bins = 50, ):
     """
     Plots histograms of mean position shifts and corrected shifts in x and y between videos
     """
 
-    fig, axs = plt.subplots(2, 2, figsize=(12, 5))
-    ax1, ax2, ax3, ax4 = axs.flatten()
+    if correction == "va" or correction == "ff":
 
-    # X shifts
-    ax1.hist(df[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=bins, range=bin_range,
-             edgecolor='black', alpha=0.6, label="x shift")
-    ax1.hist(df[f'({ref_vid_num}) to ({vid_num}) corrected mean x position shift'], bins=bins, range=bin_range,
-             edgecolor='black', alpha=0.6, label="corrected x shift")
-    ax1.set_xlabel("x shift (pixels, 650nm/pixel)")
-    ax1.set_ylabel("count")
-    ax1.set_title("X Position Shift")
-    ax1.legend()
+        fig, axs = plt.subplots(2, 2, figsize=(12, 5))
+        ax1, ax2, ax3, ax4 = axs.flatten()
 
-    # Y shifts
-    ax2.hist(df[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=bins, range=bin_range,
-             edgecolor='black', alpha=0.6, label="y shift")
-    ax2.hist(df[f'({ref_vid_num}) to ({vid_num}) corrected mean y position shift'], bins=bins, range=bin_range,
-             edgecolor='black', alpha=0.6, label="corrected y shift")
-    ax2.set_xlabel("y shift (pixels, 650nm/pixel)")
-    ax2.set_title("Y Position Shift")
-    ax2.legend()
+        # X shifts
+        ax1.hist(df[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=bins, range=bin_range,
+                 edgecolor='black', alpha=0.6, label="x shift")
+        ax1.hist(df[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean x position shift'], bins=bins, range=bin_range,
+                 edgecolor='black', alpha=0.6, label=f"{correction} corrected x shift")
+        ax1.set_xlabel("x shift (pixels, 650nm/pixel)")
+        ax1.set_ylabel("count")
+        ax1.set_title("X Position Shift")
+        ax1.legend()
 
-    # Fiducial particles shifts- check quality of correction
-    df_fid = df[df["Particle Number"] < 0]
+        # Y shifts
+        ax2.hist(df[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=bins, range=bin_range,
+                 edgecolor='black', alpha=0.6, label="y shift")
+        ax2.hist(df[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean y position shift'], bins=bins, range=bin_range,
+                 edgecolor='black', alpha=0.6, label=f"{correction} corrected y shift")
+        ax2.set_xlabel("y shift (pixels, 650nm/pixel)")
+        ax2.set_title("Y Position Shift")
+        ax2.legend()
 
-    # X shifts
-    ax3.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=fid_bins, range=fid_bin_range,
-             edgecolor='black', alpha=0.6, label="x shift")
-    ax3.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) corrected mean x position shift'], bins=fid_bins, range=fid_bin_range,
-             edgecolor='black', alpha=0.6, label="corrected x shift")
-    ax3.set_xlabel("x shift (pixels, 650nm/pixel)")
-    ax3.set_ylabel("count")
-    ax3.set_title("Fiducials X Position Shift")
-    ax3.legend()
+        # Fiducial particles shifts- check quality of correction
+        df_fid = df[df["Particle Number"] < 0]
 
-    # Y shifts
-    ax4.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=fid_bins, range=fid_bin_range,
-             edgecolor='black', alpha=0.6, label="y shift")
-    ax4.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) corrected mean y position shift'], bins=fid_bins, range=fid_bin_range,
-             edgecolor='black', alpha=0.6, label="corrected y shift")
-    ax4.set_xlabel("y shift (pixels, 650nm/pixel)")
-    ax4.set_title("Fiducials Y Position Shift")
-    ax4.legend()
+        # X shifts
+        ax3.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=fid_bins, range=fid_bin_range,
+                 edgecolor='black', alpha=0.6, label="x shift")
+        ax3.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean x position shift'], bins=fid_bins, range=fid_bin_range,
+                 edgecolor='black', alpha=0.6, label=f"{correction} corrected x shift")
+        ax3.set_xlabel("x shift (pixels, 650nm/pixel)")
+        ax3.set_ylabel("count")
+        ax3.set_title("Fiducials X Position Shift")
+        ax3.legend()
+
+        # Y shifts
+        ax4.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=fid_bins, range=fid_bin_range,
+                 edgecolor='black', alpha=0.6, label="y shift")
+        ax4.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean y position shift'], bins=fid_bins, range=fid_bin_range,
+                 edgecolor='black', alpha=0.6, label=f"{correction} corrected y shift")
+        ax4.set_xlabel("y shift (pixels, 650nm/pixel)")
+        ax4.set_title("Fiducials Y Position Shift")
+        ax4.legend()
 
 
 
 
-    fig.suptitle(f"Mean Position Shift between ({ref_vid_num}) and ({vid_num})", fontsize=14)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.show()
+        fig.suptitle(f"Mean Position Shift between ({ref_vid_num}) and ({vid_num}), {correction} correction", fontsize=14)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.show()
+
+    else:
+        print("correction type improperly speficied. Must be 'va' or 'ff'. ")
