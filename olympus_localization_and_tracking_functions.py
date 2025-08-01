@@ -8,10 +8,11 @@ from typing import List, Tuple, Optional, Dict, Any
 import pandas as pd
 
 from scipy.optimize import curve_fit, least_squares
-from scipy.interpolate import Rbf
 
 from joblib import Parallel, delayed
 import time
+
+from radialcenter import *
 import re
 
 def filter_close_particles(particles: List[Any], min_distance: float = 20.0) -> List[Any]:
@@ -153,6 +154,23 @@ def fit_particle(image):
         )
     return params, fit_ok
 
+def fit_particle_radial(image):
+    center = radialcenter(image)
+
+    # 1) check for any NaNs
+    if np.isnan(center).any():
+        fit_ok = False
+
+    # 2) check for Infs too
+    elif not np.all(np.isfinite(center)):
+        fit_ok = False
+
+    # if you get here, center[0] and center[1] are both real numbers
+    else:
+        fit_ok = True
+
+    return center, fit_ok
+
 def fit_fiducial_particle(image):
     # for 5 um fiducials
     params, fit_ok = fit_radial_gaussian_ring(image)
@@ -166,7 +184,7 @@ def fit_fiducial_particle(image):
     return params, fit_ok
 
 # Function to process a single particle
-def track_particle(index, particle, images, NS_length_pixel):
+def track_particle(index, particle, images, NS_length_pixel, fit_method):
     """Tracks a single particle by fitting its position in the cropped stack."""
     # Round and extract particle position
     x_cent = np.round(particle["Localized X Position"]).astype(int)
@@ -189,23 +207,37 @@ def track_particle(index, particle, images, NS_length_pixel):
     stack_centers_y = np.full(len(cropped_stack), np.nan)
     fit_quality = np.zeros(len(cropped_stack), dtype=bool)
 
-    # Fit Gaussian over frames for regular particle
-    for i, frame in enumerate(cropped_stack):
-        params, fit_ok = fit_particle(image=frame)
+    if fit_method == "gaussian":
+        # Fit Gaussian over frames for regular particle
+        for i, frame in enumerate(cropped_stack):
+            params, fit_ok = fit_particle(image=frame)
 
-        if fit_ok and params is not None:
-            _, x0, y0, _, _, _ = params
-            stack_centers_x[i] = x0 + x_cent - crop_size
-            stack_centers_y[i] = y0 + y_cent - crop_size
-            fit_quality[i] = True
-        else:
-            # NaNs already set by default
-            fit_quality[i] = False
+            if fit_ok and params is not None:
+                _, x0, y0, _, _, _ = params
+                stack_centers_x[i] = x0 + x_cent - crop_size
+                stack_centers_y[i] = y0 + y_cent - crop_size
+                fit_quality[i] = True
+            else:
+                # NaNs already set by default
+                fit_quality[i] = False
 
+    elif fit_method == "radial":
+        # Fit radial symmetry centers over frames for regular particle
+        for i, frame in enumerate(cropped_stack):
+            center, fit_ok = fit_particle_radial(image=frame)
+
+            if fit_ok and center is not None:
+                x0, y0 = center
+                stack_centers_x[i] = x0 + x_cent - crop_size
+                stack_centers_y[i] = y0 + y_cent - crop_size
+                fit_quality[i] = True
+            else:
+                # NaNs already set by default
+                fit_quality[i] = False
 
     return index, stack_centers_x, stack_centers_y, fit_quality  # Return results
 
-def track_particle_drift_correction(index, particle, images, NS_length_pixel, A):
+def track_particle_drift_correction(index, particle, images, NS_length_pixel, A, offset_y):
     """Tracks a single particle by fitting its position in the cropped stack."""
     # Round and extract particle position
     x_cent = particle["Localized X Position"]  # np.round(particle["Localized X Position"]).astype(int)
@@ -216,7 +248,8 @@ def track_particle_drift_correction(index, particle, images, NS_length_pixel, A)
 
     x_cent_corrected, y_cent_corrected = apply_rigid_transform(A, P).flatten()
 
-
+    if particle["Particle Number"] > 0:  # if not a fiducial particle, apply offset for reverse flow
+        y_cent_corrected = y_cent_corrected + offset_y
 
     x_cent_corrected = np.round(x_cent_corrected).astype(int)
     y_cent_corrected = np.round(y_cent_corrected).astype(int)
@@ -255,11 +288,15 @@ def track_particle_drift_correction(index, particle, images, NS_length_pixel, A)
 
 
 def track_video(video_num: int, image_path: str, background_image_path: str, particles_df, scope: str = "nikon", magnification: int = 10,
-                parallelize: bool = False, subtract_background: bool = False):
+                parallelize: bool = False, subtract_background: bool = False, fit_method: str = "gaussian"):
     start = time.time()
 
     ##--Specify magnification and pixel size --##
     NS_length_nm = 2300  # nm
+
+    if fit_method != "gaussian" and fit_method != "radial":
+        print("improper fit method specified. Must be 'gaussian' or 'radial'.")
+        return
 
     if scope == "olympus":
         if magnification == 10:
@@ -307,14 +344,14 @@ def track_video(video_num: int, image_path: str, background_image_path: str, par
     y_col_title = f"({video_num}) y positions"
 
     # Initialize empty lists in the DataFrame for results
-    particles_df.loc[:, x_col_title] = [[] for _ in range(len(particles_df))]
-    particles_df.loc[:, y_col_title] = [[] for _ in range(len(particles_df))]
+    particles_df[x_col_title] = [[] for _ in range(len(particles_df))]
+    particles_df[y_col_title] = [[] for _ in range(len(particles_df))]
 
     if parallelize:
         # Parallel execution for all particles
         num_cores = -1  # Use all available CPU cores
         results = Parallel(n_jobs=num_cores)(
-            delayed(track_particle)(index, row, images, NS_length_pixel) for index, row in particles_df.iterrows()
+            delayed(track_particle)(index, row, images, NS_length_pixel, fit_method) for index, row in particles_df.iterrows()
         )
 
         # Store results in DataFrame with separate X and Y columns
@@ -324,7 +361,7 @@ def track_video(video_num: int, image_path: str, background_image_path: str, par
 
     else:
         for index, row in particles_df.iterrows():
-            _, x_positions, y_positions, _ = track_particle(index, row, images, NS_length_pixel)
+            _, x_positions, y_positions, _ = track_particle(index, row, images, NS_length_pixel, fit_method)
             particles_df.at[index, x_col_title] = x_positions
             particles_df.at[index, y_col_title] = y_positions
     # End timing
@@ -332,12 +369,12 @@ def track_video(video_num: int, image_path: str, background_image_path: str, par
     elapsed = end - start
 
     # Display the elapsed time
-    print(f"Total execution time: {elapsed:.2f} seconds")
+    print(f"Total execution time for track_video: {elapsed:.2f} seconds")
 
 
-def track_video_drift_correction(video_num: int, ref_video_num: int, image_path: str, background_image_path: str,
-                particles_df, fiducial_particles_df, scope: str = "nikon",
-                magnification: int = 10, parallelize: bool = False, subtract_background: bool = False):
+def track_video_drift_correction(video_num: int, ref_video_num: int, image_path: str, ref_image_path: str, background_image_path: str,
+                particles_df, scope: str = "nikon", magnification: int = 10, parallelize: bool = False, subtract_background: bool = False,
+                offset_y: int = 0):
     start = time.time()
 
     ##--Specify magnification and pixel size --##
@@ -392,6 +429,22 @@ def track_video_drift_correction(video_num: int, ref_video_num: int, image_path:
     particles_df[x_col_title] = [[] for _ in range(len(particles_df))]
     particles_df[y_col_title] = [[] for _ in range(len(particles_df))]
 
+    # Create fiducial_particles_df
+    fiducial_particles_df = particles_df.copy()
+    fiducial_particles_df = fiducial_particles_df[fiducial_particles_df["Particle Number"] < 0]
+    print("Number of fiducials used for drift correction: ", len(fiducial_particles_df))
+
+    # Track reference video for fiducials
+    track_video(video_num=ref_video_num, image_path=ref_image_path, background_image_path=background_image_path,
+                particles_df=fiducial_particles_df, scope=scope, magnification=magnification, parallelize=parallelize,
+                subtract_background=subtract_background)
+    add_mean_position_cols(df=fiducial_particles_df, vid_num=ref_video_num)
+
+    # Track video for fiducials
+    track_video(video_num=video_num, image_path=image_path, background_image_path=background_image_path,
+                particles_df=fiducial_particles_df, scope=scope, magnification=magnification, parallelize=parallelize,
+                subtract_background=subtract_background)
+    add_mean_position_cols(df=fiducial_particles_df, vid_num=video_num)
 
 
     # Compute rigid body transformation A to apply to Localized X Position and Localized Y Position to re-center crops
@@ -421,7 +474,7 @@ def track_video_drift_correction(video_num: int, ref_video_num: int, image_path:
         # Parallel execution for all particles
         num_cores = -1  # Use all available CPU cores
         results = Parallel(n_jobs=num_cores)(
-            delayed(track_particle_drift_correction)(index, row, images, NS_length_pixel, A) for index, row in particles_df.iterrows()
+            delayed(track_particle_drift_correction)(index, row, images, NS_length_pixel, A, offset_y) for index, row in particles_df.iterrows()
         )
 
         # Store results in DataFrame with separate X and Y columns
@@ -431,7 +484,7 @@ def track_video_drift_correction(video_num: int, ref_video_num: int, image_path:
 
     else:
         for index, row in particles_df.iterrows():
-            _, x_positions, y_positions, _ = track_particle_drift_correction(index, row, images, NS_length_pixel, A)
+            _, x_positions, y_positions, _ = track_particle_drift_correction(index, row, images, NS_length_pixel, A, offset_y)
             particles_df.at[index, x_col_title] = x_positions
             particles_df.at[index, y_col_title] = y_positions
     # End timing
@@ -439,7 +492,7 @@ def track_video_drift_correction(video_num: int, ref_video_num: int, image_path:
     elapsed = end - start
 
     # Display the elapsed time
-    print(f"Total execution time: {elapsed:.2f} seconds")
+    print(f"Total execution time for track_video_drift_corrected: {elapsed:.2f} seconds")
 
 
 # Functions to process particle traces
@@ -458,19 +511,6 @@ def add_mean_position_cols(df, vid_num: int):
     df[f"({vid_num}) mean y position"] = df[y_col].apply(compute_mean_position)
 
 
-# Function to add mean position columns for X and Y
-def add_mean_ff_corrected_position_cols(df):
-    """Adds mean ff corrected position columns for X and Y."""
-    for col in df.columns:
-        match = re.match(r"\((\d+)\) x positions ff corrected", col)  # Match X position columns
-        if match:
-            number = match.group(1)
-            y_col = f"({number}) y positions ff corrected"
-            if y_col in df.columns:  # Ensure Y column exists
-                df[f"({number}) mean x position ff corrected"] = df[col].apply(compute_mean_position)
-                df[f"({number}) mean y position ff corrected"] = df[y_col].apply(compute_mean_position)
-
-
 # Updated function to compute standard deviation for separate X and Y columns
 def compute_stdev_position(position_list):
     """Computes the standard deviation of a list of X or Y positions."""
@@ -484,18 +524,6 @@ def add_stdev_position_cols(df, vid_num: int):
     y_col = f"({vid_num}) y positions"
     df[f"({vid_num}) stdev x position"] = df[x_col].apply(compute_stdev_position)
     df[f"({vid_num}) stdev y position"] = df[y_col].apply(compute_stdev_position)
-
-
-def add_stdev_ff_corrected_position_cols(df):
-    """Adds standard deviation position columns for ff corrected x and y positions."""
-    for col in df.columns:
-        match = re.match(r"\((\d+)\) x positions ff corrected", col)  # Match X position columns
-        if match:
-            number = match.group(1)
-            y_col = f"({number}) y positions ff corrected"
-            if y_col in df.columns:  # Ensure Y column exists
-                df[f"({number}) stdev x position ff corrected"] = df[col].apply(compute_stdev_position)
-                df[f"({number}) stdev y position ff corrected"] = df[y_col].apply(compute_stdev_position)
 
 
 # def compute_msd_from_trajectory(xy_data: np.ndarray, time_step: float, pixel_size: float):
@@ -595,88 +623,6 @@ def add_stdev_ff_corrected_position_cols(df):
 #                                 except (RuntimeError, ValueError) as e:
 #                                     print(f"Fit failed for particle at index {index}: {e}")
 
-# def add_diffusion_coefficient_corrected_cols(df, time_step, magnification):
-#     """
-#     Adds diffusion coefficient (D) columns to the DataFrame for each row (particle) based on its (x, y) positions.
-#
-#     Parameters:
-#     - df: Pandas DataFrame containing particle tracking data.
-#     - time_step: Time interval between frames (in seconds).
-#     - pixel_size: Size of a pixel in micrometers (µm).
-#
-#     Adds a new column named "(number) D" for each particle.
-#     """
-#     if magnification == 10:
-#         pixel_size = 0.650  # um
-#     elif magnification == 20:
-#         pixel_size = 0.325  # um
-#     else:
-#         print("error: magnification not properly specified!")
-#         return
-#
-#     for col in df.columns:
-#         match = re.match(r"\((\d+)\) x positions corrected", col)  # Match X position columns
-#         if match:
-#             number = match.group(1)
-#             y_col = f"({number}) y positions corrected"
-#             if y_col in df.columns:  # Ensure corresponding Y column exists
-#                 D_col_title = f"({number}) D"
-#                 df[D_col_title] = np.nan  # Initialize the new column with NaN values
-#
-#                 for index, row in df.iterrows():
-#                     x_positions = row[col]
-#                     y_positions = row[y_col]
-#
-#                     # Ensure x_positions and y_positions are numpy arrays with enough data
-#                     if isinstance(x_positions, np.ndarray) and isinstance(y_positions, np.ndarray):
-#                         if len(x_positions) > 2 and len(y_positions) > 2:
-#                             xy_data = np.column_stack((x_positions, y_positions))  # Combine x and y into a 2D array
-#                             time_lags, msd_values = compute_msd_from_trajectory(xy_data, time_step, pixel_size)
-#
-#                             if len(time_lags) > 1 and len(msd_values) > 1:
-#                                 try:
-#                                     D = fit_diffusion_coefficient(time_lags, msd_values)
-#                                     df.at[index, D_col_title] = D  # Assign the computed D to the new column
-#                                 except (RuntimeError, ValueError) as e:
-#                                     print(f"Fit failed for particle at index {index}: {e}")
-#
-
-def add_frame_by_frame_corrected_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1):
-    """
-        Adds frame by frame corrected position columns
-                """
-    x_col = f"({vid_num}) x positions"
-    y_col = f"({vid_num}) y positions"
-    x_col_corrected = f"({vid_num}) x positions ff corrected"
-    y_col_corrected = f"({vid_num}) y positions ff corrected"
-
-    # Initialize empty lists for all corrected positions
-    corrected_x_all = [[] for _ in range(len(particles_df))]
-    corrected_y_all = [[] for _ in range(len(particles_df))]
-
-    particles_df.loc[:, x_col_corrected] = pd.Series([[] for _ in range(len(particles_df))], index=particles_df.index)
-    particles_df.loc[:, y_col_corrected] = pd.Series([[] for _ in range(len(particles_df))], index=particles_df.index)
-
-    P1 = extract_mean_fiducial_positions(particles_df, vid_num=ref_vid_num)
-
-    for i in range(len(particles_df[x_col].values[0])): # for every recorded timepoint in the video
-        # extract the position of all fiducials in that frame
-        P2 = extract_fiducial_positions(particles_df, x_col, y_col, frame_index=i)
-        # define A for rigid body transformation to correct for drift
-        A = rigid_transform_least_squares(P1, P2)
-        # extract the position of all beads in that frame
-        P3 = extract_all_bead_positions(particles_df, x_col, y_col, frame_index=i)
-        # perform rigid body transformation to correct for drift
-        P3_corrected = apply_rigid_transform(A, P3)
-
-        for j in range(len(particles_df)):
-            corrected_x_all[j].append(P3_corrected[0, j])
-            corrected_y_all[j].append(P3_corrected[1, j])
-
-    # Assign full lists back to the DataFrame at once
-    particles_df[x_col_corrected] = corrected_x_all
-    particles_df[y_col_corrected] = corrected_y_all
-
 def add_video_average_corrected_mean_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1, defocus: bool = False):
     """
             Adds video average corrected mean position columns
@@ -728,227 +674,6 @@ def add_video_average_corrected_mean_position_cols(particles_df, vid_num: int = 
     print("P2 centroid:", P2.mean(axis=1))
     print("P2_corr centroid:", P2_corr.mean(axis=1))
     print("Mean residual:", (P1 - P2_corr).mean(axis=1))
-
-
-def add_video_average_all_beads_corrected_mean_position_cols(particles_df, vid_num: int = 2,
-                                                                    ref_vid_num: int = 1, flow_direction: str = "up",
-                                                                    defocus: bool = False,
-                                                                    sigma_window: float = 0.5,
-                                                                    two_peaks: bool = True, plot: bool = True,
-                                                                    range=(-1, 1)):
-    """
-        Takes mean position shift columns to identify unbound beads, and then uses a subset of
-        these beads to calculate a rigid body transformation from the reference video. This helps properly center peaks.
-        """
-    x_col_va_all_beads_corrected_mean = f"({vid_num}) mean x position va all beads corrected"
-    y_col_va_all_beads_corrected_mean = f"({vid_num}) mean y position va all beads corrected"
-
-
-    # subset df to a subset of unbound beads in video
-    unbound_particles_df = extract_unbound_particles_subset(particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num,
-                                                            flow_direction=flow_direction,
-                                                            sigma_window=sigma_window, two_peaks=two_peaks, plot=plot,
-                                                            range=range)
-    print("Length of Unbound Particles: ")
-    print(len(unbound_particles_df))
-
-    # extract mean positons of unbound (not shifted) beads in reference video
-    P1 = extract_mean_bead_positions(unbound_particles_df, vid_num=ref_vid_num)
-
-    # extract the mean positions of unbound beads in the video
-    P2 = extract_mean_bead_positions(unbound_particles_df, vid_num=vid_num)
-
-    # extract the position of all beads in the video
-    P3 = extract_mean_bead_positions(particles_df, vid_num=vid_num)
-
-    # define A for rigid body transformation/similarity transform to correct for drift, defocus
-    if defocus:
-        # A = similarity_transform_least_squares(P1, P2)
-        A, defocus, center = similarity_transform_least_squares_with_focus(P1, P2)
-        P3_corrected = apply_similarity_transform_with_defocus(A, defocus, center, P3)
-    else:
-        A = rigid_transform_least_squares(P1, P2)
-        P3_corrected = apply_rigid_transform(A, P3)
-
-    particles_df[x_col_va_all_beads_corrected_mean] = P3_corrected[0, :]  # First row → x values
-    particles_df[y_col_va_all_beads_corrected_mean] = P3_corrected[1, :]  # Second row → y values
-
-
-def extract_unbound_particles_subset(particles_df, vid_num: int = 2, ref_vid_num: int = 1, flow_direction: str = "up",
-                                     sigma_window: float = 0.5,
-                                     two_peaks: bool = True, plot: bool = True, range=(-1, 1), correction: str = ""):
-    if correction == "":
-        shift_col = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
-    elif correction == "va":
-        shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
-    elif correction == "va all beads":
-        shift_col = f"({ref_vid_num}) to ({vid_num}) va all beads corrected mean y position shift"
-
-    if two_peaks:
-        peak1, peak2 = fit_double_gaussian(particles_df, column=shift_col, plot=plot, range=range)
-
-        if flow_direction == "up":
-            unbound_peak = min([peak1, peak2], key=lambda x: x[1])
-            bound_peak = max([peak1, peak2], key=lambda x: x[1])
-        elif flow_direction == "down":
-            bound_peak = min([peak1, peak2], key=lambda x: x[1])
-            unbound_peak = max([peak1, peak2], key=lambda x: x[1])
-
-        _, mu_unbound, sigma_unbound = unbound_peak
-        _, mu_bound, sigma_bound = bound_peak
-
-        print("mu_unbound: ", mu_unbound, "sigma_unbound: ", sigma_unbound)
-        print("mu_bound: ", mu_bound, "sigma_bound: ", sigma_bound)
-        print("peak separation: ", peak2[1]-peak1[1])
-        df_particles_unbound = particles_df[(particles_df[shift_col] >= mu_unbound - sigma_window * sigma_unbound) & (
-                    particles_df[shift_col] <= mu_unbound + sigma_window * sigma_unbound)]
-
-        return df_particles_unbound
-    else:
-        peak = fit_single_gaussian(particles_df, column=shift_col, plot=plot, range=range)
-
-        mu_unbound = peak['mean']
-        sigma_unbound = peak['stddev']
-        print("mu_unbound: ", mu_unbound, "sigma_unbound: ", sigma_unbound)
-        df_particles_unbound = particles_df[(particles_df[shift_col] >= mu_unbound - sigma_window * sigma_unbound) & (
-                particles_df[shift_col] <= mu_unbound + sigma_window * sigma_unbound)]
-        return df_particles_unbound
-
-
-
-def fit_double_gaussian(df, column, bins=500, plot=True, range=(-1, 1), sigma_guess: float = 0.1):
-    def double_gaussian(x, amp1, mu1, sigma1, amp2, mu2, sigma2):
-        return (
-                amp1 * np.exp(-((x - mu1) ** 2) / (2 * sigma1 ** 2)) +
-                amp2 * np.exp(-((x - mu2) ** 2) / (2 * sigma2 ** 2))
-        )
-
-    data = df[column].dropna().values
-
-    # Histogram data
-    counts, bin_edges = np.histogram(data, bins=bins, range=range, density=True)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    # Initial guess: two peaks symmetrically around 0
-    amp_guess = np.max(counts)
-    mu1_guess, mu2_guess = np.percentile(data, [10, 90])
-    sigma_guess = sigma_guess
-    initial_guess = [amp_guess, mu1_guess, sigma_guess, amp_guess, mu2_guess, sigma_guess]
-    bounds = (
-        [0, -np.inf, 1e-6, 0, -np.inf, 1e-6],  # lower bounds
-        [np.inf, np.inf, np.inf, np.inf, np.inf, np.inf]  # upper bounds
-    )
-
-    try:
-        popt, _ = curve_fit(double_gaussian, bin_centers, counts, p0=initial_guess, bounds=bounds)
-
-        if plot:
-            amp1, mu1, sigma1, amp2, mu2, sigma2 = popt
-
-
-            x_fit = np.linspace(np.min(data), np.max(data), 1000)
-            y_fit = double_gaussian(x_fit, *popt)
-
-            plt.figure(figsize=(8, 4))
-            plt.hist(data, bins=bins, range=range, density=True, alpha=0.5, edgecolor='black', label='Data')
-            plt.plot(x_fit, y_fit, 'r-', label='Double Gaussian Fit')
-
-            plt.title(
-                f'Double Gaussian Fit for "{column}"\n'
-                f'Peak 1: amp={amp1:.2f}, μ={mu1:.3f}, σ={sigma1:.3f} | '
-                f'Peak 2: amp={amp2:.2f}, μ={mu2:.3f}, σ={sigma2:.3f}'
-            )
-
-
-            plt.xlabel(column)
-            plt.xlim(range[0], range[1])
-            plt.ylabel('Density')
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.show()
-
-        # Return the means and stddevs
-        # return {
-        #     'amp1': popt[0], 'mu1': popt[1], 'sigma1': popt[2],
-        #     'amp2': popt[3], 'mu2': popt[4], 'sigma2': popt[5]
-        # }
-        return popt[:3], popt[3:]
-
-    except RuntimeError as e:
-        print(f"Fit failed: {e}")
-        return None
-
-
-
-def fit_single_gaussian(df, column, bins=500, plot=True, range=(-1, 1), sigma_guess=0.1):
-    def gaussian(x, amp, mu, sigma):
-        return amp * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
-
-    data = df[column].dropna().values
-
-    # Histogram data
-    counts, bin_edges = np.histogram(data, bins=bins, range=range, density=True)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    # Initial guess
-    amp_guess = np.max(counts)
-    mu_guess = np.mean(data)
-    sigma_guess = sigma_guess
-    initial_guess = [amp_guess, mu_guess, sigma_guess]
-
-    try:
-        popt, _ = curve_fit(gaussian, bin_centers, counts, p0=initial_guess, bounds=([0, -np.inf, 1e-6], [np.inf, np.inf, np.inf]))
-        amp, mu, sigma = popt
-
-        if plot:
-            x_fit = np.linspace(range[0], range[1], 1000)
-            y_fit = gaussian(x_fit, *popt)
-
-            plt.figure(figsize=(8, 4))
-            plt.hist(data, bins=bins, range=range, density=True, alpha=0.5, edgecolor='black', label='Data')
-            plt.plot(x_fit, y_fit, 'r-', label='Gaussian Fit')
-
-            plt.title(
-                f'Gaussian Fit for \"{column}\"\n'
-                f'amp={amp:.2f}, μ={mu:.3f}, σ={sigma:.3f}'
-            )
-
-            plt.xlabel(column)
-            plt.xlim(range[0], range[1])
-            plt.ylabel('Density')
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.show()
-
-        return {
-            'amplitude': amp,
-            'mean': mu,
-            'stddev': sigma
-        }
-
-    except RuntimeError as e:
-        print(f"Fit failed: {e}")
-        return None
-
-
-# def extract_mean_fiducial_positions(particles_df, vid_num: int = 1):
-#     """
-#     Extracts fiducial positions for fiducial bead rows in particles dataframe
-#     """
-#     x_col = f"({vid_num}) mean x position"
-#     y_col = f"({vid_num}) mean y position"
-#     x_list, y_list = [], []
-#
-#     fiducial_particles_df = particles_df[particles_df["Particle Number"] < 0]
-#     for index, row in fiducial_particles_df.iterrows():
-#         x_list.append(row[x_col])
-#         y_list.append(row[y_col])
-#
-#     P = np.array([x_list, y_list])  # shape 2×n
-#
-#     return P
 
 def extract_mean_fiducial_positions(particles_df, vid_num: int=1):
     x_col = f"({vid_num}) mean x position"
@@ -1134,59 +859,36 @@ def add_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
     x_ref_col = f"({ref_vid_num}) mean x position"
     y_ref_col = f"({ref_vid_num}) mean y position"
 
-    df[f"({ref_vid_num}) to ({vid_num}) mean x position shift"] = df[x_col] - df[x_ref_col]
-    df[f"({ref_vid_num}) to ({vid_num}) mean y position shift"] = df[y_col] - df[y_ref_col]
-    df= df.copy()
+    x_shift_col = f"({ref_vid_num}) to ({vid_num}) mean x position shift"
+    y_shift_col = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
 
-def add_ff_corrected_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
-    x_col = f"({vid_num}) mean x position ff corrected"
-    y_col = f"({vid_num}) mean y position ff corrected"
-    x_ref_col = f"({ref_vid_num}) mean x position ff corrected"
-    y_ref_col = f"({ref_vid_num}) mean y position ff corrected"
-    df[f"({ref_vid_num}) to ({vid_num}) ff corrected mean x position shift"] = df[x_col] - df[x_ref_col]
-    df[f"({ref_vid_num}) to ({vid_num}) ff corrected mean y position shift"] = df[y_col] - df[y_ref_col]
+    displacement_col = f"({ref_vid_num}) to ({vid_num}) mean displacement"
+
+    df[x_shift_col] = df[x_col] - df[x_ref_col]
+    df[y_shift_col] = df[y_col] - df[y_ref_col]
+
+    df[displacement_col] = np.sqrt(df[x_shift_col]**2 + df[y_shift_col]**2)
+
+
 
 def add_va_corrected_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
     x_col = f"({vid_num}) mean x position va corrected"
     y_col = f"({vid_num}) mean y position va corrected"
     x_ref_col = f"({ref_vid_num}) mean x position va corrected"
     y_ref_col = f"({ref_vid_num}) mean y position va corrected"
-    df[f"({ref_vid_num}) to ({vid_num}) va corrected mean x position shift"] = df[x_col] - df[x_ref_col]
-    df[f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"] = df[y_col] - df[y_ref_col]
 
+    x_shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean x position shift"
+    y_shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
 
-def add_va_all_beads_corrected_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1,
-                                                        flow_direction: str = "up",
-                                                        center: bool = False, two_peaks: bool = False,
-                                                        fit_range: tuple = (-1, 1), plot: bool = False):
-    x_col = f"({vid_num}) mean x position va all beads corrected"
-    y_col = f"({vid_num}) mean y position va all beads corrected"
+    displacement_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean displacement"
 
-    x_ref_col = f"({ref_vid_num}) mean x position va all beads corrected"
-    y_ref_col = f"({ref_vid_num}) mean y position va all beads corrected"
-
-    x_shift_col = f"({ref_vid_num}) to ({vid_num}) va all beads corrected mean x position shift"
-    y_shift_col = f"({ref_vid_num}) to ({vid_num}) va all beads corrected mean y position shift"
     df[x_shift_col] = df[x_col] - df[x_ref_col]
     df[y_shift_col] = df[y_col] - df[y_ref_col]
 
-    if center:
-        unbound_subset_df = extract_unbound_particles_subset(df, vid_num=vid_num, ref_vid_num=ref_vid_num,
-                                                            flow_direction=flow_direction,
-                                                            sigma_window=0.5, two_peaks=two_peaks, plot=plot,
-                                                            range=fit_range, correction="va all beads")
-        x_offset = unbound_subset_df[x_shift_col].mean()
-        y_offset = unbound_subset_df[y_shift_col].mean()
+    df[displacement_col] = np.sqrt(df[x_shift_col]**2 + df[y_shift_col]**2)
 
-        if np.isnan(x_offset):
-            x_offset = 0
-        if np.isnan(y_offset):
-            y_offset = 0
 
-        print("ref vid num: ", ref_vid_num, "vid num: ", vid_num,)
-        print("x offset: ", x_offset, "y offset: ", y_offset)
-        df[x_shift_col] = df[x_shift_col] - x_offset
-        df[y_shift_col] = df[y_shift_col] - y_offset
+
 
 
 def plot_single_particle_tracking(df, image_path, video_num, frame_number, particle_num, threshold_image: bool = False, threshold: float = 0.5):
@@ -1679,13 +1381,13 @@ def create_df_particles(identified_particles_NS, identified_particles_fiducial, 
     return df_particles
 
 
-def analyze_video_motion(df, video_num, nbins: int, range_stdev = (0, 0.1)):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))  # 1 row, 2 columns
+def analyze_video_motion(df, video_num, nbins: int, range_stdev = (0, 0.2)):
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3))  # 1 row, 2 columns
 
     # Plot histograms for each column
-    title_fontsize = 24
-    axis_fontisze = 20
-    tick_fontsize = 16
+    title_fontsize = 14
+    axis_fontisze = 12
+    tick_fontsize = 10
 
 
     axes[0].hist(df[f'({video_num}) stdev x position'], bins=nbins, range=range_stdev, edgecolor='black', alpha=0.7)
@@ -1740,20 +1442,22 @@ def flat_field_correction(image_stack: np.ndarray, flat_field: np.ndarray):
     return corrected_stack
 
 
-def plot_mean_position_shift_histograms(df, correction: str, ref_vid_num: int = 1, vid_num: int=2, bin_range=(-1, 1), fid_bin_range = (-0.5, 0.5), bins=100, fid_bins = 50, ):
+def plot_mean_position_shift_histograms(df, correction: str, ref_vid_num: int = 1, vid_num: int=2, bin_range=(-1, 1), fid_bin_range = (-0.5, 0.5), bins=100, fid_bins = 50):
     """
     Plots histograms of mean position shifts and corrected shifts in x and y between videos
     """
 
-    if correction == "va" or correction == "ff" or correction == "va all beads":
+    if correction == "va":
 
-        fig, axs = plt.subplots(2, 2, figsize=(12, 5))
+        fig, axs = plt.subplots(2, 2, figsize=(18, 6))
         ax1, ax2, ax3, ax4 = axs.flatten()
 
+        df_NS = df[df["Particle Number"] > 0]
+
         # X shifts
-        ax1.hist(df[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=bins, range=bin_range,
-                 edgecolor='black', alpha=0.6, label="x shift")
-        ax1.hist(df[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean x position shift'], bins=bins, range=bin_range,
+        # ax1.hist(df[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=bins, range=bin_range,
+        #          edgecolor='black', alpha=0.6, label="x shift")
+        ax1.hist(df_NS[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean x position shift'], bins=bins, range=bin_range,
                  edgecolor='black', alpha=0.6, label=f"{correction} corrected x shift")
         ax1.set_xlabel("x shift (pixels, 650nm/pixel)")
         ax1.set_ylabel("count")
@@ -1761,46 +1465,69 @@ def plot_mean_position_shift_histograms(df, correction: str, ref_vid_num: int = 
         ax1.legend()
 
         # Y shifts
-        ax2.hist(df[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=bins, range=bin_range,
-                 edgecolor='black', alpha=0.6, label="y shift")
-        ax2.hist(df[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean y position shift'], bins=bins, range=bin_range,
+        # ax2.hist(df[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=bins, range=bin_range,
+        #          edgecolor='black', alpha=0.6, label="y shift")
+        ax2.hist(df_NS[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean y position shift'], bins=bins, range=bin_range,
                  edgecolor='black', alpha=0.6, label=f"{correction} corrected y shift")
         ax2.set_xlabel("y shift (pixels, 650nm/pixel)")
         ax2.set_title("Y Position Shift")
         ax2.legend()
 
-        # Fiducial particles shifts- check quality of correction
+        # # Displacements
+        # ax3.hist(df[f'({ref_vid_num}) to ({vid_num}) mean displacement'], bins=bins, range=bin_range,
+        #          edgecolor='black', alpha=0.6, label="displacement")
+        # ax3.hist(df[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean displacement'], bins=bins,
+        #          range=bin_range,
+        #          edgecolor='black', alpha=0.6, label=f"{correction} corrected displacement")
+        # ax3.set_xlabel("displacement (pixels, 650nm/pixel)")
+        # ax3.set_title("Displacement")
+        # ax3.legend()
+
+        # Fiducial particles shifts - check quality of correction
         df_fid = df[df["Particle Number"] < 0]
 
         # X shifts
-        ax3.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=fid_bins, #range=fid_bin_range,
-                 edgecolor='black', alpha=0.6, label="x shift")
         ax3.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean x position shift'], bins=fid_bins, #range=fid_bin_range,
                  edgecolor='black', alpha=0.6, label=f"{correction} corrected x shift")
+        ax3.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=fid_bins,  # range=fid_bin_range,
+                 edgecolor='black', alpha=0.6, label="x shift")
         ax3.set_xlabel("x shift (pixels, 650nm/pixel)")
         ax3.set_ylabel("count")
         ax3.set_title("Fiducials X Position Shift")
         ax3.legend()
 
         # Y shifts
-        ax4.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=fid_bins, #range=fid_bin_range,
-                 edgecolor='black', alpha=0.6, label="y shift")
         ax4.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean y position shift'], bins=fid_bins, #range=fid_bin_range,
                  edgecolor='black', alpha=0.6, label=f"{correction} corrected y shift")
+        ax4.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=fid_bins,  # range=fid_bin_range,
+                 edgecolor='black', alpha=0.6, label="y shift")
         ax4.set_xlabel("y shift (pixels, 650nm/pixel)")
         ax4.set_title("Fiducials Y Position Shift")
         ax4.legend()
+
+        # # Displacement
+        # ax6.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) mean displacement'], bins=fid_bins,  # range=fid_bin_range,
+        #          edgecolor='black', alpha=0.6, label="displacement")
+        # ax6.hist(df_fid[f'({ref_vid_num}) to ({vid_num}) {correction} corrected mean displacement'], bins=fid_bins,
+        #          # range=fid_bin_range,
+        #          edgecolor='black', alpha=0.6, label=f"{correction} corrected displacement")
+        # ax6.set_xlabel("displacement (pixels, 650nm/pixel)")
+        # ax6.set_title("Fiducials Displacement")
+        # ax6.legend()
+
 
         fig.suptitle(f"Mean Position Shift between ({ref_vid_num}) and ({vid_num}), {correction} correction", fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
 
     elif correction == "":
-        fig, axs = plt.subplots(1, 2, figsize=(12, 3))
+        fig, axs = plt.subplots(1, 2, figsize=(18, 3))
         ax1, ax2 = axs.flatten()
 
+        df_NS = df[df["Particle Number"] > 0]
+
         # X shifts
-        ax1.hist(df[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=bins, range=bin_range,
+        ax1.hist(df_NS[f'({ref_vid_num}) to ({vid_num}) mean x position shift'], bins=bins, range=bin_range,
                  edgecolor='black', alpha=0.6, label="x shift")
         ax1.set_xlabel("x shift (pixels, 650nm/pixel)")
         ax1.set_ylabel("count")
@@ -1808,131 +1535,26 @@ def plot_mean_position_shift_histograms(df, correction: str, ref_vid_num: int = 
         ax1.legend()
 
         # Y shifts
-        ax2.hist(df[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=bins, range=bin_range,
+        ax2.hist(df_NS[f'({ref_vid_num}) to ({vid_num}) mean y position shift'], bins=bins, range=bin_range,
                  edgecolor='black', alpha=0.6, label="y shift")
         ax2.set_xlabel("y shift (pixels, 650nm/pixel)")
         ax2.set_title("Y Position Shift")
         ax2.legend()
 
+        # # Displacements
+        # ax3.hist(df[f'({ref_vid_num}) to ({vid_num}) mean displacement'], bins=bins, range=bin_range,
+        #          edgecolor='black', alpha=0.6, label="displacement")
+        # ax3.set_xlabel("displacement (pixels, 650nm/pixel)")
+        # ax3.set_title("Displacement")
+        # ax3.legend()
+        #
         fig.suptitle(f"Mean Position Shift between ({ref_vid_num}) and ({vid_num}), {correction} correction",
                      fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
 
     else:
-        print("correction type improperly speficied. Must be 'va' or 'va all beads', 'ff', or ''. ")
-
-
-def extract_mean_fiducial_positions_3d(particles_df, vid_num: int = 1):
-    x_col = f"({vid_num}) mean x position"
-    y_col = f"({vid_num}) mean y position"
-    x_list, y_list = [], []
-
-    fiducial_particles_df = particles_df[particles_df["Particle Number"] < 0]
-    for _, row in fiducial_particles_df.iterrows():
-        x_list.append(row[x_col])
-        y_list.append(row[y_col])
-
-    return np.array([x_list, y_list, np.zeros(len(x_list))])  # shape (3, n), z=0
-
-
-def extract_mean_bead_positions_3d(particles_df, vid_num: int = 1):
-    x_col = f"({vid_num}) mean x position"
-    y_col = f"({vid_num}) mean y position"
-    x_list, y_list = [], []
-
-    for _, row in particles_df.iterrows():
-        x_list.append(row[x_col])
-        y_list.append(row[y_col])
-
-    return np.array([x_list, y_list, np.zeros(len(x_list))])  # shape (3, n), z=0
-
-def kabsch_rigid_transform(P1, P2):
-    """
-    Perform the Kabsch algorithm to find the best-fit 3D rotation and translation
-    from P2 to P1. Both P1 and P2 are 3×n matrices.
-    Returns: R (3x3), t (3x1)
-    """
-    assert P1.shape == P2.shape
-
-    centroid_P1 = np.mean(P1, axis=1, keepdims=True)
-    centroid_P2 = np.mean(P2, axis=1, keepdims=True)
-
-    P1_centered = P1 - centroid_P1
-    P2_centered = P2 - centroid_P2
-
-    H = P2_centered @ P1_centered.T
-    U, _, Vt = np.linalg.svd(H)
-    R_opt = Vt.T @ U.T
-
-    if np.linalg.det(R_opt) < 0:
-        Vt[-1, :] *= -1
-        R_opt = Vt.T @ U.T
-
-    t_opt = centroid_P1 - R_opt @ centroid_P2
-    return R_opt, t_opt
-
-def apply_rigid_transform_3d(R_opt, t_opt, P):
-    """Applies 3D rigid transform to 3×n matrix P and returns the projected 2D positions."""
-    P_transformed = R_opt @ P + t_opt
-    return P_transformed[:2, :]  # project to 2D image plane
-
-def add_video_average_3d_corrected_mean_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1):
-    """3d position correction based on fiducial positions"""
-    x_col_corrected = f"({vid_num}) mean x position va corrected"  # eventually rename to 3d
-    y_col_corrected = f"({vid_num}) mean y position va corrected"
-
-    # Extract fiducial positions in 3D (z=0 plane)
-    P1 = extract_mean_fiducial_positions_3d(particles_df, vid_num=ref_vid_num)
-    P2 = extract_mean_fiducial_positions_3d(particles_df, vid_num=vid_num)
-
-    # Compute optimal transform
-    R_opt, t_opt = kabsch_rigid_transform(P1, P2)
-
-    # Apply to all beads
-    P3 = extract_mean_bead_positions_3d(particles_df, vid_num=vid_num)
-    P3_corrected = apply_rigid_transform_3d(R_opt, t_opt, P3)
-
-    particles_df[x_col_corrected] = P3_corrected[0, :]
-    particles_df[y_col_corrected] = P3_corrected[1, :]
-
-
-
-def add_video_average_3d_all_beads_corrected_mean_position_cols(particles_df, vid_num: int = 2,
-                                                                    ref_vid_num: int = 1, sigma_window: float = 0.5,
-                                                                    two_peaks: bool = True, plot: bool = True, range=(-1, 1)):
-    """
-        Takes mean position shift columns to identify unbound beads, and then uses a subset of
-        these beads to calculate a 3d rigid body transformation from the reference video. This helps properly center peaks.
-        """
-    x_col_va_3d_all_beads_corrected_mean_shift = f"({vid_num}) mean x position va all beads corrected"
-    y_col_va_3d_all_beads_corrected_mean_shift = f"({vid_num}) mean y position va all beads corrected"
-
-
-    # subset df to a subset of unbound beads in video
-    unbound_particles_df = extract_unbound_particles_subset(particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num,
-                                                            sigma_window=sigma_window, two_peaks=two_peaks, plot=plot,
-                                                            range=range)
-
-    # extract mean positons of unbound (not shifted) beads in reference video
-    P1 = extract_mean_bead_positions_3d(unbound_particles_df, vid_num=ref_vid_num)
-
-    # extract the mean positions of unbound beads in the video
-    P2 = extract_mean_bead_positions_3d(unbound_particles_df, vid_num=vid_num)
-
-    # Compute optimal transform
-    R_opt, t_opt = kabsch_rigid_transform(P1, P2)
-
-    # extract the position of all beads in the video
-    P3 = extract_mean_bead_positions_3d(particles_df, vid_num=vid_num)
-
-    # perform rigid body transformation to correct for drift
-    P3_corrected = apply_rigid_transform_3d(R_opt, t_opt, P3)
-
-    particles_df[x_col_va_3d_all_beads_corrected_mean_shift] = P3_corrected[0, :]  # First row → x values
-    particles_df[y_col_va_3d_all_beads_corrected_mean_shift] = P3_corrected[1, :]  # Second row → y values
-
-
+        print("correction type improperly speficied. Must be 'va' or ''. ")
 
 
 def build_rigid_transform(theta, tx, ty):
@@ -1975,6 +1597,7 @@ def manually_rotate_mean_position_cols(particles_df, vid_num: int = 1, new_vid_n
     particles_df[x_col_corrected] = P1_transformed[0, :]  # First row → x values
     particles_df[y_col_corrected] = P1_transformed[1, :]  # Second row → y values
 
+
 def manually_defocus_mean_position_cols(particles_df, vid_num: int = 1, new_vid_num: int = 2, defocus: float = 0.0, image_shape=(1200,1200)):
 
     x_col_corrected = f"({new_vid_num}) mean x position"
@@ -1990,29 +1613,6 @@ def manually_defocus_mean_position_cols(particles_df, vid_num: int = 1, new_vid_
 
     particles_df[x_col_corrected] = distorted[0, :]  # First row → x values
     particles_df[y_col_corrected] = distorted[1, :]  # Second row → y values
-
-
-
-
-def digitize_on_baseline_shift(particles_df, vid_num: int = 2, ref_vid_num: int = 1, unbound_window: tuple = (-0.14, 0.14), bound_window: tuple = (0.16, 0.44), correction: str = "va all beads"):
-    state_col = f"({vid_num}) state"
-
-    if correction == "":
-        shift_col = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
-    elif correction == "va":
-        shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
-    elif correction == "va all beads":
-        shift_col = f"({ref_vid_num}) to ({vid_num}) va all beads corrected mean y position shift"
-
-    def map_state(val):
-        if unbound_window[0] <= val <= unbound_window[1]:
-            return False
-        elif bound_window[0] <= val <= bound_window[1]:
-            return True
-        else:
-            return np.nan  # Handle unexpected values gracefully
-
-    particles_df[state_col] = particles_df[shift_col].apply(map_state)
 
 def compute_mean_displacement_fiducials(particles_df, vid_num: int =2, ref_vid_num: int = 1):
     # subset df to fiducial particles
@@ -2045,59 +1645,571 @@ def compute_displacement_individual_fiducials(particles_df, vid_num: int =2, ref
 
     return r, displacements
 
+def fit_single_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500, plot=True, bin_range=(-0.15, 0.15), sigma_guess: float = 0.02):
+    def single_gaussian(x, amp, mu, sigma):
+        return amp * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
 
-def correct_radial_distortion(
-    particles_df,
-    vid_num: int = 2,
-    ref_vid_num: int = 1,
-    image_size: tuple[int,int] = None,
-    smooth: float = 0.0
-) -> pd.DataFrame:
-    """
-    Corrects radial (barrel/pincushion) distortion in the bead positions
-    by fitting thin-plate splines to the fiducial shifts.
+    column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+    data = df[column].dropna().values
 
-    Args:
-        particles_df: DataFrame with bead+fiducial detections.
-        vid_num:      Target video index.
-        ref_vid_num:  Baseline reference video index.
-        image_size:   (width, height) in pixels, if you want to recenter.
-        smooth:       RBF smoothing parameter.
+    # Histogram data
+    counts, bin_edges = np.histogram(data, bins=bins, range=bin_range, density=False)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
-    Returns:
-        DataFrame with new columns:
-          (vid) mean x position rd
-          (vid) mean y position rd
-    """
-    # 1) pull out Nx2 arrays of (x,y)
-    pts_ref = extract_mean_fiducial_positions(particles_df, vid_num=ref_vid_num).T
-    pts_cur = extract_mean_fiducial_positions(particles_df, vid_num=vid_num).T
-    beads = extract_mean_bead_positions(particles_df, vid_num=vid_num).T
+    # Initial guess: peaks at 0 and -0.25
+    idx_peak = np.argmin(np.abs(bin_centers-0.00))
 
-    # 2) optionally recenter around image principal point
-    if image_size is not None:
-        cx, cy = image_size[0]/2, image_size[1]/2
-        center = np.array([cx, cy], float)
-        pts_ref = pts_ref - center
-        pts_cur = pts_cur - center
-        beads = beads - center
+    amp_guess = counts[idx_peak]
+
+    mu_guess = bin_centers[idx_peak]
+
+    initial_guess = [amp_guess, mu_guess, sigma_guess]
+    bounds = (
+        [0, bin_range[0], 1e-6],  # lower bounds
+        [np.inf, bin_range[1], 1]  # upper bounds
+    )
+
+    try:
+        popt, _ = curve_fit(single_gaussian, bin_centers, counts, p0=initial_guess, bounds=bounds)
+
+        amp_fit, mu_fit, sigma_fit = popt
+        if plot:
+
+
+
+            x_fit = np.linspace(bin_range[0], bin_range[1], 1000)
+            y_fit = single_gaussian(x_fit, *popt)
+
+            plt.figure(figsize=(8, 4))
+            plt.hist(data, bins=bins, range=bin_range, density=False, alpha=0.5, edgecolor='black', label='Data')
+            plt.plot(x_fit, y_fit, 'r-', label='Double Gaussian Fit')
+
+            plt.axvline(x=mu_fit + sigma_fit, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_fit - sigma_fit, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_fit + 2 * sigma_fit, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_fit - 2 * sigma_fit, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_fit + 3 * sigma_fit, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_fit - 3 * sigma_fit, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_fit + 4 * sigma_fit, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_fit - 4 * sigma_fit, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_fit + 5 * sigma_fit, color='red', linestyle='--', linewidth=1, label='5 sigma')
+            plt.axvline(x=mu_fit - 5 * sigma_fit, color='red', linestyle='--', linewidth=1, label='5 sigma')
+
+
+            plt.title(
+                f'Double Gaussian Fit for "{column}"\n'
+                f'Fit Peak 1: amp={amp_fit:.2f}, μ={mu_fit:.3f}, σ={sigma_fit:.3f} | '
+            )
+
+
+            plt.xlabel(column)
+            plt.xlim(bin_range[0], bin_range[1])
+            plt.ylabel('Density')
+            #plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+
+        return amp_fit, mu_fit, sigma_fit
+
+    except RuntimeError as e:
+        print(f"Fit failed: {e}")
+        return None
+
+
+def fit_double_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500, plot=True, bin_range=(-1, 1), bound_peak_y_mean_shift: float = -0.25, sigma_guess: float = 0.02):
+    def double_gaussian(x, amp1, mu1, sigma1, amp2, mu2, sigma2):
+        return (
+                amp1 * np.exp(-((x - mu1) ** 2) / (2 * sigma1 ** 2)) +
+                amp2 * np.exp(-((x - mu2) ** 2) / (2 * sigma2 ** 2))
+        )
+
+    column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+    data = df[column].dropna().values
+
+    # Histogram data
+    counts, bin_edges = np.histogram(data, bins=bins, range=bin_range, density=False)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    # Initial guess: peaks at 0 and -0.25
+    idx_unbound = np.argmin(np.abs(bin_centers-0.00))
+    idx_bound = np.argmin(np.abs(bin_centers-bound_peak_y_mean_shift))
+
+    amp_guess_unbound = counts[idx_unbound]
+    amp_guess_bound = counts[idx_bound]
+
+    mu_guess_unbound = bin_centers[idx_unbound]
+    mu_guess_bound = bin_centers[idx_bound]
+
+    initial_guess = [amp_guess_unbound, mu_guess_unbound, sigma_guess, amp_guess_bound, mu_guess_bound, sigma_guess]
+    bounds = (
+        [0, bin_range[0], 1e-6, 0, bin_range[0], 1e-6],  # lower bounds
+        [np.inf, bin_range[1], 1, np.inf, bin_range[1], 1]  # upper bounds
+    )
+
+    try:
+        popt, _ = curve_fit(double_gaussian, bin_centers, counts, p0=initial_guess, bounds=bounds)
+
+        amp_unbound, mu_unbound, sigma_unbound, amp_bound, mu_bound, sigma_bound = popt
+        if plot:
+
+
+
+            x_fit = np.linspace(bin_range[0], bin_range[1], 1000)
+            y_fit = double_gaussian(x_fit, *popt)
+
+            plt.figure(figsize=(8, 4))
+            plt.hist(data, bins=bins, range=bin_range, density=False, alpha=0.5, edgecolor='black', label='Data')
+            plt.plot(x_fit, y_fit, 'r-', label='Double Gaussian Fit')
+
+            plt.axvline(x=mu_unbound + sigma_unbound, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_unbound - sigma_unbound, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_unbound + 2 * sigma_unbound, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_unbound - 2 * sigma_unbound, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_unbound + 3 * sigma_unbound, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_unbound - 3 * sigma_unbound, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_unbound + 4 * sigma_unbound, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_unbound - 4 * sigma_unbound, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_unbound + 5 * sigma_unbound, color='red', linestyle='--', linewidth=1, label='5 sigma')
+            plt.axvline(x=mu_unbound - 5 * sigma_unbound, color='red', linestyle='--', linewidth=1, label='5 sigma')
+
+            plt.axvline(x=mu_bound + sigma_bound, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_bound - sigma_bound, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_bound + 2 * sigma_bound, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_bound - 2 * sigma_bound, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_bound + 3 * sigma_bound, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_bound - 3 * sigma_bound, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_bound + 4 * sigma_bound, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_bound - 4 * sigma_bound, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_bound + 5 * sigma_bound, color='red', linestyle='--', linewidth=1, label='5 sigma')
+            plt.axvline(x=mu_bound - 5 * sigma_bound, color='red', linestyle='--', linewidth=1, label='5 sigma')
+
+
+            plt.title(
+                f'Double Gaussian Fit for "{column}"\n'
+                f'Unbound Peak 1: amp={amp_unbound:.2f}, μ={mu_unbound:.3f}, σ={sigma_unbound:.3f} | '
+                f'Bound Peak 2: amp={amp_bound:.2f}, μ={mu_bound:.3f}, σ={sigma_bound:.3f}'
+            )
+
+
+            plt.xlabel(column)
+            plt.xlim(bin_range[0], bin_range[1])
+            plt.ylabel('Density')
+            #plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+
+        return amp_unbound, mu_unbound, sigma_unbound, amp_bound, mu_bound, sigma_bound
+
+    except RuntimeError as e:
+        print(f"Fit failed: {e}")
+        return None
+
+
+def fit_constrained_double_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500, plot=True, bin_range=(-1, 1), bound_peak_y_mean_shift: float = -0.25, sigma_guess: float = 0.02):
+    def constrained_double_gaussian(x, amp1, mu1, sigma1, amp2, delta_mu, sigma2):
+        mu2 = mu1 + delta_mu
+        return (
+                amp1 * np.exp(-((x - mu1) ** 2) / (2 * sigma1 ** 2)) +
+                amp2 * np.exp(-((x - mu2) ** 2) / (2 * sigma2 ** 2))
+        )
+
+    column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+    data = df[column].dropna().values
+
+    # Histogram data
+    counts, bin_edges = np.histogram(data, bins=bins, range=bin_range, density=False)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    # Initial guess: peaks at 0 and -0.25
+    idx_unbound = np.argmin(np.abs(bin_centers-0.00))
+    idx_bound = np.argmin(np.abs(bin_centers-bound_peak_y_mean_shift))
+
+    amp_guess_unbound = counts[idx_unbound]
+    amp_guess_bound = counts[idx_bound]
+
+    mu_guess_unbound = bin_centers[idx_unbound]
+    mu_guess_bound = bin_centers[idx_bound]
+
+    delta_mu_guess = mu_guess_bound - mu_guess_unbound
+    initial_guess = [amp_guess_unbound, mu_guess_unbound, sigma_guess, amp_guess_bound, delta_mu_guess, sigma_guess]
+
+    bounds = (
+        [0, bin_range[0], 1e-6, 0, -0.3, 1e-6],  # lower bounds
+        [np.inf, bin_range[1], 1, np.inf, -0.23, 1]  # upper bounds
+    )
+
+    # initial_guess = [amp_guess_unbound, mu_guess_unbound, sigma_guess, amp_guess_bound, mu_guess_bound, sigma_guess]
+    # bounds = (
+    #     [0, bin_range[0], 1e-6, 0, bin_range[0], 1e-6],  # lower bounds
+    #     [np.inf, bin_range[1], 1, np.inf, bin_range[1], 1]  # upper bounds
+    # )
+
+    try:
+        popt, _ = curve_fit(constrained_double_gaussian, bin_centers, counts, p0=initial_guess, bounds=bounds)
+
+        amp_unbound, mu_unbound, sigma_unbound, amp_bound, mu_bound, sigma_bound = popt
+        if plot:
+
+
+
+            x_fit = np.linspace(bin_range[0], bin_range[1], 1000)
+            y_fit = constrained_double_gaussian(x_fit, *popt)
+
+            plt.figure(figsize=(8, 4))
+            plt.hist(data, bins=bins, range=bin_range, density=False, alpha=0.5, edgecolor='black', label='Data')
+            plt.plot(x_fit, y_fit, 'r-', label='Double Gaussian Fit')
+
+            plt.axvline(x=mu_unbound + sigma_unbound, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_unbound - sigma_unbound, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_unbound + 2 * sigma_unbound, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_unbound - 2 * sigma_unbound, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_unbound + 3 * sigma_unbound, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_unbound - 3 * sigma_unbound, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_unbound + 4 * sigma_unbound, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_unbound - 4 * sigma_unbound, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_unbound + 5 * sigma_unbound, color='red', linestyle='--', linewidth=1, label='5 sigma')
+            plt.axvline(x=mu_unbound - 5 * sigma_unbound, color='red', linestyle='--', linewidth=1, label='5 sigma')
+
+            plt.axvline(x=mu_bound + sigma_bound, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_bound - sigma_bound, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu_bound + 2 * sigma_bound, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_bound - 2 * sigma_bound, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu_bound + 3 * sigma_bound, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_bound - 3 * sigma_bound, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu_bound + 4 * sigma_bound, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_bound - 4 * sigma_bound, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu_bound + 5 * sigma_bound, color='red', linestyle='--', linewidth=1, label='5 sigma')
+            plt.axvline(x=mu_bound - 5 * sigma_bound, color='red', linestyle='--', linewidth=1, label='5 sigma')
+
+
+            plt.title(
+                f'Double Gaussian Fit for "{column}"\n'
+                f'Unbound Peak 1: amp={amp_unbound:.2f}, μ={mu_unbound:.3f}, σ={sigma_unbound:.3f} | '
+                f'Bound Peak 2: amp={amp_bound:.2f}, μ={mu_bound:.3f}, σ={sigma_bound:.3f}'
+            )
+
+
+            plt.xlabel(column)
+            plt.xlim(bin_range[0], bin_range[1])
+            plt.ylabel('Density')
+            #plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+
+        return amp_unbound, mu_unbound, sigma_unbound, amp_bound, mu_bound, sigma_bound
+
+    except RuntimeError as e:
+        print(f"Fit failed: {e}")
+        return None
+
+
+def fit_single_gaussian_for_stdev(df, vid_num:int = 1, axis: str = "y", bins=500, plot=True, bin_range=(0, 0.25), sigma_guess=0.05):
+    def gaussian(x, amp, mu, sigma):
+        return amp * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
+
+    column = f"({vid_num}) stdev {axis} position"
+    data = df[column].dropna().values
+
+    # Histogram data
+    counts, bin_edges = np.histogram(data, bins=bins, range=bin_range, density=False)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    # Initial guess
+    amp_guess = np.max(counts)
+    mu_guess = np.mean(data)
+    sigma_guess = sigma_guess
+    initial_guess = [amp_guess, mu_guess, sigma_guess]
+
+    try:
+        popt, _ = curve_fit(gaussian, bin_centers, counts, p0=initial_guess, bounds=([0, 0, 1e-6], [3*amp_guess, 0.25, 0.25]))
+        amp, mu, sigma = popt
+
+        if plot:
+            x_fit = np.linspace(bin_range[0], bin_range[1], 1000)
+            y_fit = gaussian(x_fit, *popt)
+
+            plt.figure(figsize=(8, 4))
+            plt.hist(data, bins=bins, range=bin_range, density=False, alpha=0.5, edgecolor='black', label='Data')
+            plt.plot(x_fit, y_fit, 'r-', label='Gaussian Fit')
+            plt.axvline(x=mu+sigma, color='blue', linestyle='--', linewidth=1, label='1 sigma')
+            plt.axvline(x=mu+2*sigma, color='green', linestyle='--', linewidth=1, label='2 sigma')
+            plt.axvline(x=mu+3*sigma, color='yellow', linestyle='--', linewidth=1, label='3 sigma')
+            plt.axvline(x=mu+4*sigma, color='orange', linestyle='--', linewidth=1, label='4 sigma')
+            plt.axvline(x=mu+5*sigma, color='red', linestyle='--', linewidth=1, label='5 sigma')
+
+
+            plt.title(
+                f'Gaussian Fit for \"{column}\"\n'
+                f'amp={amp:.2f}, μ={mu:.3f}, σ={sigma:.3f}'
+            )
+
+            plt.xlabel(column)
+            plt.xlim(bin_range[0], bin_range[1])
+            plt.ylabel('Density')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+        return amp, mu, sigma
+
+    except RuntimeError as e:
+        print(f"Fit failed: {e}")
+        return None
+
+
+def mask_on_stdev_x_manual(particles_df, vid_num:int = 1, window = (0, 0.2)):
+    # specify window to create mask from
+    std_x_col = f"({vid_num}) stdev x position"
+    std_x = particles_df[std_x_col].values
+    mask = (std_x > window[0]) & (std_x < window[1])
+
+    return mask
+
+def mask_on_stdev_x_automated(particles_df, vid_num:int = 1, m_sigma: float = 5.0, filter: str = "in", plot: bool = True):
+    # specify stdev data to create mask from
+    std_x_col = f"({vid_num}) stdev x position"
+    std_x = particles_df[std_x_col].values
+
+    # fit gaussian to stdev data
+    amp, mu, sigma = fit_single_gaussian_for_stdev(df=particles_df, vid_num=vid_num, axis="x", bins=500, plot=plot,
+                                                   bin_range=(0, 0.25), sigma_guess=0.05)
+
+    if filter == "in":
+        mask = (std_x > mu - m_sigma * sigma) & (std_x < mu + m_sigma * sigma)
+    elif filter == "out":
+        mask = (std_x > mu + m_sigma * sigma)
+
+    return mask
+
+def mask_on_stdev_y_manual(particles_df, vid_num:int = 1, window = (0, 0.2)):
+    # specify window to create mask from
+    std_y_col = f"({vid_num}) stdev y position"
+    std_y = particles_df[std_y_col].values
+    mask = (std_y > window[0]) & (std_y < window[1])
+
+    return mask
+
+def mask_on_stdev_y_automated(particles_df, vid_num:int = 1, m_sigma: float = 5.0, filter: str = "in", plot: bool = True):
+    # specify stdev around mean to create mask from
+    std_y_col = f"({vid_num}) stdev y position"
+    std_y = particles_df[std_y_col].values
+
+    # fit gaussian to stdev data
+    amp, mu, sigma = fit_single_gaussian_for_stdev(df=particles_df, vid_num=vid_num, axis="y", bins=500, plot=plot,
+                                                   bin_range=(0, 0.25), sigma_guess=0.05)
+
+    if filter == "in":
+        mask = (std_y > mu - m_sigma * sigma) & (std_y < mu + m_sigma * sigma)
+    elif filter == "out":
+        mask = (std_y > mu + m_sigma * sigma)
+
+    return mask
+
+def mask_on_NS_particles(particles_df):
+    # specify stdev around mean to create mask from
+    particle_numbers = particles_df["Particle Number"].values
+    mask = particle_numbers > 0
+
+    return mask
+
+def mask_on_mean_position_shift(particles_df, ref_vid_num: int = 1, vid_num: int = 2, mean: float = 0, sigma: float = 0.02, n_sigma: float = 3):
+    shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+    shift_values = particles_df[shift_col].values
+    mask = (shift_values < mean + n_sigma*sigma) & (shift_values > mean - n_sigma*sigma)
+
+    return mask
+
+def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baseline: float = 0.02, delta_bound_peak: float = -0.25, n_sigma: float = 3, m_sigma:float = 3):
+    # (1)
+    NS_particle_mask = mask_on_NS_particles(particles_df=particles_df)
+
+    # (2)
+    # _, mu_unbound, _, _, _, _ = (
+    #     fit_double_gaussian_y_shift(df=particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num, bins=500, plot=False, bin_range=(-1, 1),
+    #                                 bound_peak_y_mean_shift=delta_bound_peak, sigma_guess=sigma_baseline))
+    if vid_num == 1:
+        mu_unbound = 0.00
     else:
-        center = np.array([0.0, 0.0])
+        _, mu_unbound, _ = fit_single_gaussian_y_shift(df=particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num, bins=100, plot=False,
+                                    bin_range=(-0.15, 0.15), sigma_guess=0.02)
 
-    # 3) build two independent RBFs
-    rbf_x = Rbf(pts_cur[:,0], pts_cur[:,1], pts_ref[:,0],
-                function='thin_plate', smooth=smooth)
-    rbf_y = Rbf(pts_cur[:,0], pts_cur[:,1], pts_ref[:,1],
-                function='thin_plate', smooth=smooth)
+    unbound_position_shift_mask = mask_on_mean_position_shift(particles_df=particles_df, vid_num=vid_num,ref_vid_num=ref_vid_num,
+                                    mean=mu_unbound, sigma=sigma_baseline, n_sigma=n_sigma)
+    bound_position_shift_mask = mask_on_mean_position_shift(particles_df=particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num,
+                                    mean=mu_unbound+delta_bound_peak, sigma=sigma_baseline, n_sigma=n_sigma)
 
-    # 4) warp your beads
-    x_corr = rbf_x(beads[:,0], beads[:,1]) + center[0]
-    y_corr = rbf_y(beads[:,0], beads[:,1]) + center[1]
+    # (3)
+    stdev_y_mask = mask_on_stdev_y_automated(particles_df=particles_df, vid_num=vid_num, m_sigma=m_sigma, filter="in", plot=False)
 
-    # 5) write back into the DataFrame (new columns)
-    x_col = f"({vid_num}) mean x position" # rd"
-    y_col = f"({vid_num}) mean y position" # rd"
-    particles_df.loc[:, x_col] = x_corr
-    particles_df.loc[:, y_col] = y_corr
+    unbound_mask = NS_particle_mask & unbound_position_shift_mask & stdev_y_mask
+    bound_mask = NS_particle_mask & bound_position_shift_mask & stdev_y_mask
 
-    return particles_df
+    particles_df[f"({vid_num}) state"] = pd.Series([pd.NA] * len(particles_df), dtype='boolean')
+    particles_df.loc[bound_mask, f"({vid_num}) state"] = True
+    particles_df.loc[unbound_mask, f"({vid_num}) state"] = False
+
+    add_num_bound_instances(particles_df)
+
+    return
+
+def digitize_on_baseline_shift_manual(particles_df, vid_num: int = 2, ref_vid_num: int = 1, unbound_window: tuple = (-0.0, 0.0), bound_window: tuple = (0.0, 0.0), correction: str = "va"):
+    state_col = f"({vid_num}) state"
+
+    if correction == "":
+        shift_col = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
+    elif correction == "va":
+        shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+
+
+    def map_state(val):
+        if unbound_window[0] <= val <= unbound_window[1]:
+            return False
+        elif bound_window[0] <= val <= bound_window[1]:
+            return True
+        else:
+            return np.nan
+
+    particles_df[state_col] = particles_df[shift_col].apply(map_state)
+
+    add_num_bound_instances(particles_df)
+
+
+def add_num_bound_instances(particles_df, ref_vid_num = 1):
+    state_cols = [col for col in particles_df.columns if col.endswith("state")] # need to digitize with same ref vid num
+
+    for vid_num, _ in enumerate(state_cols, start=ref_vid_num):
+        if vid_num == ref_vid_num:
+            particles_df[f"({ref_vid_num}) to ({vid_num}) total bound instances"] = (
+                particles_df[f"({vid_num}) state"].fillna(False).astype(int))
+        else:
+            particles_df[f"({ref_vid_num}) to ({vid_num}) total bound instances"] = (
+                    particles_df[f"({vid_num}) state"].fillna(False).astype(int) +
+                    particles_df[f"({ref_vid_num}) to ({vid_num-1}) total bound instances"])
+
+
+def create_aggregate_digitized_df(particles_df):
+    unbound_list = []
+    bound_list = []
+    undetermined_list = []
+    vid_nums = []
+
+    state_cols = [col for col in particles_df.columns if col.endswith("state")]
+
+    for col in state_cols:
+
+        vid_num = int(re.search(r"\((\d+)\)", col).group(1))
+        unbound_count = (particles_df[col] == False).sum()
+        bound_count = (particles_df[col] == True).sum()
+        undetermined_count = particles_df[col].isna().sum()
+
+
+        vid_nums.append(vid_num)
+        unbound_list.append(unbound_count)
+        bound_list.append(bound_count)
+        undetermined_list.append(undetermined_count)
+
+    vid_nums = np.asarray(vid_nums)
+    unbound_list = np.asarray(unbound_list)
+    bound_list = np.asarray(bound_list)
+    undetermined_list = np.asarray(undetermined_list)
+
+    identified_list = bound_list+unbound_list
+    total_list = bound_list+unbound_list+undetermined_list
+
+
+
+    # Stack columns and create DataFrame
+    aggregate_df = pd.DataFrame(np.column_stack((vid_nums, total_list, identified_list,
+                                                 undetermined_list, undetermined_list/total_list,
+                                                 bound_list, bound_list/identified_list, bound_list/total_list,
+                                                 unbound_list, unbound_list/identified_list, unbound_list/total_list)),
+                                columns=[
+        "video number", "total number particles", "number identified particles",
+        "number undetermined particles", "fraction total unidentified particles",
+        "number particles bound", "fraction identified particles bound", "fraction total particles bond",
+        "number particles unbound", "fraction identified particles unbound", "fraction total particles unbound"
+        ])
+
+    # Cast specific columns to integers
+    int_cols = [
+        "video number", "total number particles", "number identified particles",
+        "number undetermined particles", "number particles bound", "number particles unbound"
+    ]
+    aggregate_df[int_cols] = aggregate_df[int_cols].astype(int)
+
+    return aggregate_df
+
+
+def subset_aggregate_digitized_df(particles_df, aggregate_df, ref_vid_num: int, vid_nums: List[int]):
+    subset = particles_df[f"({ref_vid_num}) state"] == False
+
+    subset_cols = [
+        f"subset ({ref_vid_num}) total number particles",
+        f"subset ({ref_vid_num}) number identified particles",
+        f"subset ({ref_vid_num}) number undetermined particles",
+        f"subset ({ref_vid_num}) fraction total undetermined particles",
+        f"subset ({ref_vid_num}) number particles bound",
+        f"subset ({ref_vid_num}) fraction identified particles bound",
+        f"subset ({ref_vid_num}) fraction total particles bound",
+        f"subset ({ref_vid_num}) number particles unbound",
+        f"subset ({ref_vid_num}) fraction identified particles unbound",
+        f"subset ({ref_vid_num}) fraction total particles unbound"
+    ]
+
+    for col in subset_cols:
+        if "number" in col:  # specify as int
+            aggregate_df[col] = pd.Series([pd.NA] * len(aggregate_df), dtype="Int64")
+        else:  # specify as float
+            aggregate_df[col] = np.nan
+
+    vid_list = [ref_vid_num] + vid_nums
+    for vid_num in vid_list:
+        current_state_col = f"({vid_num}) state"
+
+        unbound_count = (particles_df[subset][current_state_col] == False).sum()
+        bound_count = (particles_df[subset][current_state_col] == True).sum()
+        undetermined_count = particles_df[subset][current_state_col].isna().sum()
+        
+        total_count = unbound_count+bound_count+undetermined_count
+        identified_count = unbound_count+bound_count
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[0]] = total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[1]] = identified_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[2]] = undetermined_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[3]] = undetermined_count/total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[4]] = bound_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[5]] = bound_count/identified_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[6]] = bound_count/total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[7]] = unbound_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[8]] = unbound_count / identified_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[9]] = unbound_count / total_count
+
+
+
+def compute_subset_new_binders(particles_df, vid_num: int = 2, ref_vid_num: int = 1):
+    start_unbound_total = (particles_df[f"({ref_vid_num}) state"] == False).sum()
+
+    end_bound_total = (
+                particles_df[particles_df[f"({ref_vid_num}) state"] == False][f"({vid_num}) state"] == True).sum()
+
+    fraction_new_binders = end_bound_total / start_unbound_total
+
+    return start_unbound_total, end_bound_total, fraction_new_binders
+
+
+def combine_particle_dataframes(dfs: List[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Take a list of particle dataframes
+    and return a new DataFrame with all their rows appended.
+    The index is reset to 0…N_total-1.
+    """
+    if not dfs:
+        return pd.DataFrame()  # or raise ValueError("No dataframes provided")
+    return pd.concat(dfs, ignore_index=True)
