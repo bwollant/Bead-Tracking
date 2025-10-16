@@ -3,8 +3,10 @@ from skimage import measure
 import numpy as np
 import tifffile
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+
 from scipy.spatial.distance import pdist, squareform
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Iterable
 import pandas as pd
 
 from scipy.optimize import curve_fit, least_squares
@@ -14,6 +16,12 @@ import time
 
 from radialcenter import *
 import re
+from collections import Counter
+
+import math
+import random
+
+
 
 def filter_close_particles(particles: List[Any], min_distance: float = 20.0) -> List[Any]:
     """
@@ -184,7 +192,7 @@ def fit_fiducial_particle(image):
     return params, fit_ok
 
 # Function to process a single particle
-def track_particle(index, particle, images, NS_length_pixel, fit_method):
+def track_particle(index, particle, images, NS_length_pixel, fit_method, crop_size_NS: float = 1.5):
     """Tracks a single particle by fitting its position in the cropped stack."""
     # Round and extract particle position
     x_cent = np.round(particle["Localized X Position"]).astype(int)
@@ -192,7 +200,7 @@ def track_particle(index, particle, images, NS_length_pixel, fit_method):
 
 
 
-    crop_size = np.round(1.5 * NS_length_pixel).astype(int)
+    crop_size = np.round(crop_size_NS * NS_length_pixel).astype(int)
 
     # Crop stack around the particle
     y_start = max(0, y_cent - crop_size)
@@ -237,7 +245,7 @@ def track_particle(index, particle, images, NS_length_pixel, fit_method):
 
     return index, stack_centers_x, stack_centers_y, fit_quality  # Return results
 
-def track_particle_drift_correction(index, particle, images, NS_length_pixel, A, offset_y):
+def track_particle_drift_correction(index, particle, images, NS_length_pixel, A, offset_y, crop_size_NS: float = 1.5):
     """Tracks a single particle by fitting its position in the cropped stack."""
     # Round and extract particle position
     x_cent = particle["Localized X Position"]  # np.round(particle["Localized X Position"]).astype(int)
@@ -254,7 +262,7 @@ def track_particle_drift_correction(index, particle, images, NS_length_pixel, A,
     x_cent_corrected = np.round(x_cent_corrected).astype(int)
     y_cent_corrected = np.round(y_cent_corrected).astype(int)
 
-    crop_size = np.round(1.5 * NS_length_pixel).astype(int)
+    crop_size = np.round(crop_size_NS * NS_length_pixel).astype(int)
 
     # Crop stack around the particle
     y_start = max(0, y_cent_corrected - crop_size)
@@ -288,7 +296,7 @@ def track_particle_drift_correction(index, particle, images, NS_length_pixel, A,
 
 
 def track_video(video_num: int, image_path: str, background_image_path: str, particles_df, scope: str = "nikon", magnification: int = 10,
-                parallelize: bool = False, subtract_background: bool = False, fit_method: str = "gaussian"):
+                parallelize: bool = False, subtract_background: bool = False, fit_method: str = "gaussian", crop_size_NS: float = 1.5):
     start = time.time()
 
     ##--Specify magnification and pixel size --##
@@ -351,7 +359,7 @@ def track_video(video_num: int, image_path: str, background_image_path: str, par
         # Parallel execution for all particles
         num_cores = -1  # Use all available CPU cores
         results = Parallel(n_jobs=num_cores)(
-            delayed(track_particle)(index, row, images, NS_length_pixel, fit_method) for index, row in particles_df.iterrows()
+            delayed(track_particle)(index, row, images, NS_length_pixel, fit_method, crop_size_NS) for index, row in particles_df.iterrows()
         )
 
         # Store results in DataFrame with separate X and Y columns
@@ -361,7 +369,7 @@ def track_video(video_num: int, image_path: str, background_image_path: str, par
 
     else:
         for index, row in particles_df.iterrows():
-            _, x_positions, y_positions, _ = track_particle(index, row, images, NS_length_pixel, fit_method)
+            _, x_positions, y_positions, _ = track_particle(index, row, images, NS_length_pixel, fit_method, crop_size_NS)
             particles_df.at[index, x_col_title] = x_positions
             particles_df.at[index, y_col_title] = y_positions
     # End timing
@@ -371,10 +379,16 @@ def track_video(video_num: int, image_path: str, background_image_path: str, par
     # Display the elapsed time
     print(f"Total execution time for track_video: {elapsed:.2f} seconds")
 
+def add_mean_position_cols(df, vid_num: int):
+    """Adds mean position columns for X and Y."""
+    x_col = f"({vid_num}) x positions"
+    y_col = f"({vid_num}) y positions"
+    df[f"({vid_num}) mean x position"] = df[x_col].apply(compute_mean_position)
+    df[f"({vid_num}) mean y position"] = df[y_col].apply(compute_mean_position)
 
 def track_video_drift_correction(video_num: int, ref_video_num: int, image_path: str, ref_image_path: str, background_image_path: str,
                 particles_df, scope: str = "nikon", magnification: int = 10, parallelize: bool = False, subtract_background: bool = False,
-                offset_y: int = 0):
+                offset_y: int = 0, error_threshold: float = 0.25):
     start = time.time()
 
     ##--Specify magnification and pixel size --##
@@ -470,6 +484,25 @@ def track_video_drift_correction(video_num: int, ref_video_num: int, image_path:
     # define A for rigid body transformation to correct for drift
     A = rigid_transform_least_squares(P2, P1)
 
+    # Check for outliers and recompute A if necessary
+    P1_aligned = apply_rigid_transform(A, P1)  # Result: 2 × n
+
+    errors = np.linalg.norm(P1_aligned - P2, axis=0)  # shape: (n,)
+
+    inlier_mask = errors < error_threshold
+
+    if np.sum(inlier_mask) < 2:
+        raise ValueError("Too few inlier fiducials after filtering by error threshold.")
+
+    if len(inlier_mask) > np.sum(inlier_mask):  # if outliers, recompute A
+        # Recompute A with only inliers
+        print("outliers discarded, recomputing")
+        A = rigid_transform_least_squares(P2[:, inlier_mask], P1[:, inlier_mask])
+
+
+
+
+
     if parallelize:
         # Parallel execution for all particles
         num_cores = -1  # Use all available CPU cores
@@ -495,35 +528,61 @@ def track_video_drift_correction(video_num: int, ref_video_num: int, image_path:
     print(f"Total execution time for track_video_drift_corrected: {elapsed:.2f} seconds")
 
 
+def add_position_mean_std_cols(particles_df, image_paths: List[str]):
+    all_new = []
+    for vid_num, path in enumerate(image_paths, start=1):
+        x_col = f"({vid_num}) x positions"
+        y_col = f"({vid_num}) y positions"
+
+        # x_stats = particles_df[x_col].apply(compute_position_mean_std).apply(pd.Series)
+        # y_stats = particles_df[y_col].apply(compute_position_mean_std).apply(pd.Series)
+        mean_x_pos = particles_df[x_col].apply(compute_mean_position)
+        std_x_pos = particles_df[x_col].apply(compute_stdev_position)
+        mean_y_pos = particles_df[y_col].apply(compute_mean_position)
+        std_y_pos = particles_df[y_col].apply(compute_stdev_position)
+
+        x_col_has_nan = particles_df[x_col].apply(
+            lambda lst: np.isnan(lst).any() if isinstance(lst, (list, np.ndarray)) else False
+        )
+        y_col_has_nan = particles_df[y_col].apply(
+            lambda lst: np.isnan(lst).any() if isinstance(lst, (list, np.ndarray)) else False
+        )
+
+        new = pd.DataFrame({
+            f"({vid_num}) x positions have NaN": x_col_has_nan,
+            f"({vid_num}) y positions have NaN": y_col_has_nan,
+            f"({vid_num}) mean x position": mean_x_pos,
+            f"({vid_num}) stdev x position": std_x_pos,
+            f"({vid_num}) mean y position": mean_y_pos,
+            f"({vid_num}) stdev y position": std_y_pos,
+        })
+        all_new.append(new)
+
+    new_block = pd.concat(all_new, axis=1)
+    particles_df = pd.concat([particles_df, new_block], axis=1)
+
+    # defragment
+    particles_df = particles_df.copy()
+
+    return particles_df
+
 # Functions to process particle traces
 def compute_mean_position(position_list):
     """Computes the mean position from a list of X or Y positions."""
     position_array = np.array(position_list)
-    return np.mean(position_array).tolist() if len(position_array) > 0 else np.nan
-
-
-# Function to add mean position columns for X and Y
-def add_mean_position_cols(df, vid_num: int):
-    """Adds mean position columns for X and Y."""
-    x_col = f"({vid_num}) x positions"
-    y_col = f"({vid_num}) y positions"
-    df[f"({vid_num}) mean x position"] = df[x_col].apply(compute_mean_position)
-    df[f"({vid_num}) mean y position"] = df[y_col].apply(compute_mean_position)
-
+    if position_array.size == 0:
+        return np.nan
+    position_array = position_array[np.isfinite(position_array)]
+    return np.mean(position_array) if len(position_array) > 0 else np.nan
 
 # Updated function to compute standard deviation for separate X and Y columns
 def compute_stdev_position(position_list):
     """Computes the standard deviation of a list of X or Y positions."""
     position_array = np.array(position_list)
-    return np.std(position_array).tolist() if len(position_array) > 0 else np.nan
-
-
-def add_stdev_position_cols(df, vid_num: int):
-    """Adds standard deviation position columns for X and Y."""
-    x_col = f"({vid_num}) x positions"
-    y_col = f"({vid_num}) y positions"
-    df[f"({vid_num}) stdev x position"] = df[x_col].apply(compute_stdev_position)
-    df[f"({vid_num}) stdev y position"] = df[y_col].apply(compute_stdev_position)
+    if position_array.size == 0:
+        return np.nan
+    position_array = position_array[np.isfinite(position_array)]
+    return np.std(position_array) if len(position_array) > 0 else np.nan
 
 
 # def compute_msd_from_trajectory(xy_data: np.ndarray, time_step: float, pixel_size: float):
@@ -623,34 +682,23 @@ def add_stdev_position_cols(df, vid_num: int):
 #                                 except (RuntimeError, ValueError) as e:
 #                                     print(f"Fit failed for particle at index {index}: {e}")
 
-def add_video_average_corrected_mean_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1, defocus: bool = False):
-    """
-            Adds video average corrected mean position columns
-                    """
-    x_col_corrected = f"({vid_num}) mean x position va corrected"
-    y_col_corrected = f"({vid_num}) mean y position va corrected"
+def add_video_average_corrected_mean_position_cols(particles_df, image_paths: List[str], ref_vid_num: int = 1, print_rbt: bool = False):
+    all_new = []
+    for vid_num, path in enumerate(image_paths, start=1):
+        x_col_corrected = f"({vid_num}) mean x position va corrected"
+        y_col_corrected = f"({vid_num}) mean y position va corrected"
 
-    # Initialize nan cols for all corrected mean positions
-    # particles_df.loc[:, x_col_corrected] = np.nan
-    # particles_df.loc[:, y_col_corrected] = np.nan
+        # extract mean positons of all fiducials in reference video
+        P1 = extract_mean_fiducial_positions(particles_df, vid_num=ref_vid_num)
 
-    # extract mean positons of all fiducials in reference video
-    P1 = extract_mean_fiducial_positions(particles_df, vid_num=ref_vid_num)
+        # extract the mean positions of all fiducial in the video
+        P2 = extract_mean_fiducial_positions(particles_df, vid_num=vid_num)
 
-    # extract the mean positions of all fiducial in the video
-    P2 = extract_mean_fiducial_positions(particles_df, vid_num=vid_num)
+        assert P1.shape == P2.shape
 
-    assert P1.shape == P2.shape
+        # extract the position of all beads in the video
+        P3 = extract_mean_bead_positions(particles_df, vid_num=vid_num)
 
-    # extract the position of all beads in the video
-    P3 = extract_mean_bead_positions(particles_df, vid_num=vid_num)
-
-    # define A for rigid body transformation/similarity transform to correct for drift, defocus
-    if defocus:
-        # A = similarity_transform_least_squares(P1, P2)
-        A, defocus, center = similarity_transform_least_squares_with_focus(P1, P2)
-        P3_corrected = apply_similarity_transform_with_defocus(A, defocus, center, P3)
-    else:
         # P1 and P2 should both be 2×n arrays
         mask_finite = np.isfinite(P1).all(axis=0) & np.isfinite(P2).all(axis=0)
         if not mask_finite.all():
@@ -665,15 +713,84 @@ def add_video_average_corrected_mean_position_cols(particles_df, vid_num: int = 
         A = rigid_transform_least_squares(P1, P2)
         P3_corrected = apply_rigid_transform(A, P3)
 
+        x_pos_mean_corrected = P3_corrected[0, :]  # First row → x values
+        y_pos_mean_corrected = P3_corrected[1, :]  # Second row → y values
 
-    particles_df[x_col_corrected] = P3_corrected[0, :]  # First row → x values
-    particles_df[y_col_corrected] = P3_corrected[1, :]  # Second row → y values
 
-    P2_corr = apply_rigid_transform(A, P2)
-    print("P1 centroid:", P1.mean(axis=1))
-    print("P2 centroid:", P2.mean(axis=1))
-    print("P2_corr centroid:", P2_corr.mean(axis=1))
-    print("Mean residual:", (P1 - P2_corr).mean(axis=1))
+        P2_corr = apply_rigid_transform(A, P2)
+
+        if print_rbt:
+            print("Video Number: ", vid_num)
+            print("P1 centroid:", P1.mean(axis=1))
+            print("P2 centroid:", P2.mean(axis=1))
+            print("P2_corr centroid:", P2_corr.mean(axis=1))
+            print("Mean residual:", (P1 - P2_corr).mean(axis=1))
+
+        new = pd.DataFrame({
+            x_col_corrected: x_pos_mean_corrected,
+            y_col_corrected: y_pos_mean_corrected,
+        })
+        all_new.append(new)
+
+    new_block = pd.concat(all_new, axis=1)
+    particles_df = pd.concat([particles_df, new_block], axis=1)
+
+    # defragment
+    particles_df = particles_df.copy()
+
+    return particles_df
+
+# def add_video_average_corrected_mean_position_cols(particles_df, vid_num: int = 2, ref_vid_num: int = 1, defocus: bool = False):
+#     """
+#             Adds video average corrected mean position columns
+#                     """
+#     x_col_corrected = f"({vid_num}) mean x position va corrected"
+#     y_col_corrected = f"({vid_num}) mean y position va corrected"
+#
+#     # Initialize nan cols for all corrected mean positions
+#     # particles_df.loc[:, x_col_corrected] = np.nan
+#     # particles_df.loc[:, y_col_corrected] = np.nan
+#
+#     # extract mean positons of all fiducials in reference video
+#     P1 = extract_mean_fiducial_positions(particles_df, vid_num=ref_vid_num)
+#
+#     # extract the mean positions of all fiducial in the video
+#     P2 = extract_mean_fiducial_positions(particles_df, vid_num=vid_num)
+#
+#     assert P1.shape == P2.shape
+#
+#     # extract the position of all beads in the video
+#     P3 = extract_mean_bead_positions(particles_df, vid_num=vid_num)
+    #
+    # # define A for rigid body transformation/similarity transform to correct for drift, defocus
+    # if defocus:
+    #     # A = similarity_transform_least_squares(P1, P2)
+    #     A, defocus, center = similarity_transform_least_squares_with_focus(P1, P2)
+    #     P3_corrected = apply_similarity_transform_with_defocus(A, defocus, center, P3)
+    # else:
+    #     # P1 and P2 should both be 2×n arrays
+    #     mask_finite = np.isfinite(P1).all(axis=0) & np.isfinite(P2).all(axis=0)
+    #     if not mask_finite.all():
+    #         # drop any columns (landmarks) that aren’t fully finite
+    #         P1 = P1[:, mask_finite]
+    #         P2 = P2[:, mask_finite]
+    #
+    #     # now make sure you still have enough points
+    #     if P1.shape[1] < 2:
+    #         raise ValueError(f"Not enough valid fiducials after dropping nonfinite data: only {P1.shape[1]} left.")
+    #
+    #     A = rigid_transform_least_squares(P1, P2)
+    #     P3_corrected = apply_rigid_transform(A, P3)
+    #
+    #
+    # particles_df[x_col_corrected] = P3_corrected[0, :]  # First row → x values
+    # particles_df[y_col_corrected] = P3_corrected[1, :]  # Second row → y values
+    #
+    # P2_corr = apply_rigid_transform(A, P2)
+    # print("P1 centroid:", P1.mean(axis=1))
+    # print("P2 centroid:", P2.mean(axis=1))
+    # print("P2_corr centroid:", P2_corr.mean(axis=1))
+    # print("Mean residual:", (P1 - P2_corr).mean(axis=1))
 
 def extract_mean_fiducial_positions(particles_df, vid_num: int=1):
     x_col = f"({vid_num}) mean x position"
@@ -768,34 +885,34 @@ def rigid_transform_least_squares(P1, P2):
     A = np.hstack((R, np.array([[tx], [ty]])))
     return A
 
-def similarity_transform_least_squares(P1, P2):
-    """
-    Estimate scale (s), rotation (theta), and translation (tx, ty) using least squares.
-    Returns 2x3 transformation matrix A.
-    """
-
-    def residuals(params, P1, P2):
-        s, theta, tx, ty = params
-        R = s * np.array([
-            [np.cos(theta), -np.sin(theta)],
-            [np.sin(theta),  np.cos(theta)]
-        ])
-        transformed = R @ P2 + np.array([[tx], [ty]])
-        return (P1 - transformed).ravel()
-
-    # Initial guess: no scale, no rotation, no translation
-    initial_params = [1.0, 0.0, 0.0, 0.0]
-    result = least_squares(residuals, initial_params, args=(P1, P2))
-
-    s, theta, tx, ty = result.x
-    print(f'scale: {s}, theta: {theta}, tx: {tx}, ty: {ty}')
-
-    R = s * np.array([
-        [np.cos(theta), -np.sin(theta)],
-        [np.sin(theta),  np.cos(theta)]
-    ])
-    A = np.hstack((R, np.array([[tx], [ty]])))
-    return A
+# def similarity_transform_least_squares(P1, P2):
+#     """
+#     Estimate scale (s), rotation (theta), and translation (tx, ty) using least squares.
+#     Returns 2x3 transformation matrix A.
+#     """
+#
+#     def residuals(params, P1, P2):
+#         s, theta, tx, ty = params
+#         R = s * np.array([
+#             [np.cos(theta), -np.sin(theta)],
+#             [np.sin(theta),  np.cos(theta)]
+#         ])
+#         transformed = R @ P2 + np.array([[tx], [ty]])
+#         return (P1 - transformed).ravel()
+#
+#     # Initial guess: no scale, no rotation, no translation
+#     initial_params = [1.0, 0.0, 0.0, 0.0]
+#     result = least_squares(residuals, initial_params, args=(P1, P2))
+#
+#     s, theta, tx, ty = result.x
+#     print(f'scale: {s}, theta: {theta}, tx: {tx}, ty: {ty}')
+#
+#     R = s * np.array([
+#         [np.cos(theta), -np.sin(theta)],
+#         [np.sin(theta),  np.cos(theta)]
+#     ])
+#     A = np.hstack((R, np.array([[tx], [ty]])))
+#     return A
 
 def apply_rigid_transform(A, P):
     """
@@ -806,89 +923,109 @@ def apply_rigid_transform(A, P):
     P_hom = np.vstack((P, np.ones((1, n))))  # Make P 3×n
     return A @ P_hom  # Result is 2×n
 
-def similarity_transform_least_squares_with_focus(P1, P2, image_shape=(1200,1200)):
-    """
-    Estimate scale (s), rotation (theta), translation (tx, ty), and defocus radial distortion.
-    Returns 2x3 transformation matrix A and defocus scalar.
-    """
+# def similarity_transform_least_squares_with_focus(P1, P2, image_shape=(1200,1200)):
+#     """
+#     Estimate scale (s), rotation (theta), translation (tx, ty), and defocus radial distortion.
+#     Returns 2x3 transformation matrix A and defocus scalar.
+#     """
+#
+#     if image_shape is not None:
+#         center = np.array([[image_shape[1] / 2], [image_shape[0] / 2]])
+#     else:
+#         center = np.mean(P2, axis=1, keepdims=True)
+#
+#     def residuals(params, P1, P2):
+#         theta, tx, ty, defocus = params
+#         R = np.array([
+#             [np.cos(theta), -np.sin(theta)],
+#             [np.sin(theta),  np.cos(theta)]
+#         ])
+#         radial = P2 - center
+#         distorted = P2 + defocus * radial
+#         transformed = R @ distorted + np.array([[tx], [ty]])
+#         return (P1 - transformed).ravel()
+#
+#     initial_params = [0.0, 0.0, 0.0, 0.0]
+#     result = least_squares(residuals, initial_params, args=(P1, P2))
+#
+#     theta, tx, ty, defocus = result.x
+#     print(f'theta: {theta:.4f}, tx: {tx:.4f}, ty: {ty:.4f}, defocus: {defocus:.6f}')
+#
+#     R = np.array([
+#         [np.cos(theta), -np.sin(theta)],
+#         [np.sin(theta),  np.cos(theta)]
+#     ])
+#     A = np.hstack((R, np.array([[tx], [ty]])))
+#     return A, defocus, center
 
-    if image_shape is not None:
-        center = np.array([[image_shape[1] / 2], [image_shape[0] / 2]])
-    else:
-        center = np.mean(P2, axis=1, keepdims=True)
-
-    def residuals(params, P1, P2):
-        theta, tx, ty, defocus = params
-        R = np.array([
-            [np.cos(theta), -np.sin(theta)],
-            [np.sin(theta),  np.cos(theta)]
-        ])
-        radial = P2 - center
-        distorted = P2 + defocus * radial
-        transformed = R @ distorted + np.array([[tx], [ty]])
-        return (P1 - transformed).ravel()
-
-    initial_params = [0.0, 0.0, 0.0, 0.0]
-    result = least_squares(residuals, initial_params, args=(P1, P2))
-
-    theta, tx, ty, defocus = result.x
-    print(f'theta: {theta:.4f}, tx: {tx:.4f}, ty: {ty:.4f}, defocus: {defocus:.6f}')
-
-    R = np.array([
-        [np.cos(theta), -np.sin(theta)],
-        [np.sin(theta),  np.cos(theta)]
-    ])
-    A = np.hstack((R, np.array([[tx], [ty]])))
-    return A, defocus, center
-
-def apply_similarity_transform_with_defocus(A, defocus, center, P):
-    """
-    Applies similarity transform A with defocus to 2xn matrix P.
-    Returns transformed 2xn matrix.
-    """
-    radial = P - center
-    distorted = P + defocus * radial
-    n = distorted.shape[1]
-    P_hom = np.vstack((distorted, np.ones((1, n))))
-    return A @ P_hom
-
-
-def add_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
-    x_col = f"({vid_num}) mean x position"
-    y_col = f"({vid_num}) mean y position"
-    x_ref_col = f"({ref_vid_num}) mean x position"
-    y_ref_col = f"({ref_vid_num}) mean y position"
-
-    x_shift_col = f"({ref_vid_num}) to ({vid_num}) mean x position shift"
-    y_shift_col = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
-
-    displacement_col = f"({ref_vid_num}) to ({vid_num}) mean displacement"
-
-    df[x_shift_col] = df[x_col] - df[x_ref_col]
-    df[y_shift_col] = df[y_col] - df[y_ref_col]
-
-    df[displacement_col] = np.sqrt(df[x_shift_col]**2 + df[y_shift_col]**2)
+# def apply_similarity_transform_with_defocus(A, defocus, center, P):
+#     """
+#     Applies similarity transform A with defocus to 2xn matrix P.
+#     Returns transformed 2xn matrix.
+#     """
+#     radial = P - center
+#     distorted = P + defocus * radial
+#     n = distorted.shape[1]
+#     P_hom = np.vstack((distorted, np.ones((1, n))))
+#     return A @ P_hom
 
 
+def add_mean_position_shift_cols(particles_df, image_paths: List[str], ref_vid_num: int = 1):
+    all_new = []
+    for vid_num, path in enumerate(image_paths, start=1):
+        x_col = f"({vid_num}) mean x position"
+        y_col = f"({vid_num}) mean y position"
+        x_ref_col = f"({ref_vid_num}) mean x position"
+        y_ref_col = f"({ref_vid_num}) mean y position"
 
-def add_va_corrected_mean_position_shift_cols(df, vid_num: int = 2, ref_vid_num: int = 1):
-    x_col = f"({vid_num}) mean x position va corrected"
-    y_col = f"({vid_num}) mean y position va corrected"
-    x_ref_col = f"({ref_vid_num}) mean x position va corrected"
-    y_ref_col = f"({ref_vid_num}) mean y position va corrected"
+        x_shift_col = f"({ref_vid_num}) to ({vid_num}) mean x position shift"
+        y_shift_col = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
 
-    x_shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean x position shift"
-    y_shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+        x_shift = particles_df[x_col] - particles_df[x_ref_col]
+        y_shift = particles_df[y_col] - particles_df[y_ref_col]
 
-    displacement_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean displacement"
+        new = pd.DataFrame({
+            x_shift_col: x_shift,
+            y_shift_col: y_shift,
+        })
+        all_new.append(new)
 
-    df[x_shift_col] = df[x_col] - df[x_ref_col]
-    df[y_shift_col] = df[y_col] - df[y_ref_col]
+    new_block = pd.concat(all_new, axis=1)
+    particles_df = pd.concat([particles_df, new_block], axis=1)
 
-    df[displacement_col] = np.sqrt(df[x_shift_col]**2 + df[y_shift_col]**2)
+    # defragment
+    particles_df = particles_df.copy()
+
+    return particles_df
 
 
+def add_va_corrected_mean_position_shift_cols(particles_df, image_paths: List[str], ref_vid_num: int = 1):
+    all_new = []
+    for vid_num, path in enumerate(image_paths, start=1):
+        x_col = f"({vid_num}) mean x position va corrected"
+        y_col = f"({vid_num}) mean y position va corrected"
+        x_ref_col = f"({ref_vid_num}) mean x position va corrected"
+        y_ref_col = f"({ref_vid_num}) mean y position va corrected"
 
+        x_shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean x position shift"
+        y_shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+
+        x_shift = particles_df[x_col] - particles_df[x_ref_col]
+        y_shift = particles_df[y_col] - particles_df[y_ref_col]
+
+        new = pd.DataFrame({
+            x_shift_col: x_shift,
+            y_shift_col: y_shift,
+        })
+        all_new.append(new)
+
+    new_block = pd.concat(all_new, axis=1)
+    particles_df = pd.concat([particles_df, new_block], axis=1)
+
+    # defragment
+    particles_df = particles_df.copy()
+
+    return particles_df
 
 
 def plot_single_particle_tracking(df, image_path, video_num, frame_number, particle_num, threshold_image: bool = False, threshold: float = 0.5):
@@ -1645,32 +1782,67 @@ def compute_displacement_individual_fiducials(particles_df, vid_num: int =2, ref
 
     return r, displacements
 
-def fit_single_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500, plot=True, bin_range=(-0.15, 0.15), sigma_guess: float = 0.02):
-    def single_gaussian(x, amp, mu, sigma):
-        return amp * np.exp(-((x - mu) ** 2) / (2 * sigma ** 2))
 
-    column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+
+
+
+def fit_single_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500, plot=True, bin_range=(-0.15, 0.15), sigma_guess: float = 0.02, correction: str = "va"):
+
+
+    def single_gaussian(x, amp, mu, sigma):
+        return amp * np.exp(-((x - mu) ** 2) / (2.0 * sigma ** 2))
+
+    if correction == "va":
+        column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+    elif correction == "":
+        column = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
+
     data = df[column].dropna().values
 
     # Histogram data
-    counts, bin_edges = np.histogram(data, bins=bins, range=bin_range, density=False)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    # counts, bin_edges = np.histogram(data, bins=bins, range=bin_range, density=False)
+    # bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    # build histogram
+    counts, edges = np.histogram(data, bins=bins, range=bin_range)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    bw = edges[1] - edges[0]
 
-    # Initial guess: peaks at 0 and -0.25
-    idx_peak = np.argmin(np.abs(bin_centers-0.00))
+    # use only informative bins and convert to float
+    mask = counts > 0
+    x = centers[mask]
+    y = counts[mask].astype(float)
 
-    amp_guess = counts[idx_peak]
+    # Initial guess:
+    # idx_peak = np.argmin(np.abs(bin_centers-0.00))
+    #
+    # amp_guess = counts[idx_peak]
+    #
+    # mu_guess = bin_centers[idx_peak]
 
-    mu_guess = bin_centers[idx_peak]
+    # robust initial guesses
+    mu_guess = np.average(x, weights=y)  # weighted mean
+    sigma_guess = sigma_guess  # max(np.std(data), bw)  # not smaller than one bin
+    amp_guess = y.max()  # peak count
 
-    initial_guess = [amp_guess, mu_guess, sigma_guess]
-    bounds = (
-        [0, bin_range[0], 1e-6],  # lower bounds
-        [np.inf, bin_range[1], 1]  # upper bounds
-    )
+    # initial_guess = [amp_guess, mu_guess, sigma_guess]
+    # bounds = (
+    #     [0, bin_range[0], 1e-6],  # lower bounds
+    #     [np.inf, bin_range[1], 1]  # upper bounds
+    # )
+
+    p0 = [amp_guess, mu_guess, sigma_guess]
+    lb = [0.0, bin_range[0], bw/4]  # sensible σ lower bound
+    ub = [np.inf, bin_range[1], (bin_range[1] - bin_range[0])]
+
+    # Poisson-like weights: sqrt(count)
+    sigma_w = np.sqrt(y + 1.0)
 
     try:
-        popt, _ = curve_fit(single_gaussian, bin_centers, counts, p0=initial_guess, bounds=bounds)
+        # popt, _ = curve_fit(single_gaussian, bin_centers, counts, p0=initial_guess, bounds=bounds)
+        popt, pcov = curve_fit(
+            single_gaussian, x, y, p0=p0, bounds=(lb, ub),
+            sigma=sigma_w, absolute_sigma=True, maxfev=20000
+        )
 
         amp_fit, mu_fit, sigma_fit = popt
         if plot:
@@ -1718,14 +1890,21 @@ def fit_single_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500
         return None
 
 
-def fit_double_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500, plot=True, bin_range=(-1, 1), bound_peak_y_mean_shift: float = -0.25, sigma_guess: float = 0.02):
+
+
+
+def fit_double_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500, plot=True, bin_range=(-1, 1), bound_peak_y_mean_shift: float = -0.25, sigma_guess: float = 0.02, unbound_peak_location_guess: float = 0.00, correction: str = "va"):
     def double_gaussian(x, amp1, mu1, sigma1, amp2, mu2, sigma2):
         return (
                 amp1 * np.exp(-((x - mu1) ** 2) / (2 * sigma1 ** 2)) +
                 amp2 * np.exp(-((x - mu2) ** 2) / (2 * sigma2 ** 2))
         )
 
-    column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+    if correction == "va":
+        column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+    elif correction == "":
+        column = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
+
     data = df[column].dropna().values
 
     # Histogram data
@@ -1733,8 +1912,8 @@ def fit_double_gaussian_y_shift(df, vid_num: int = 2, ref_vid_num = 1,  bins=500
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
     # Initial guess: peaks at 0 and -0.25
-    idx_unbound = np.argmin(np.abs(bin_centers-0.00))
-    idx_bound = np.argmin(np.abs(bin_centers-bound_peak_y_mean_shift))
+    idx_unbound = np.argmin(np.abs(bin_centers-unbound_peak_location_guess))
+    idx_bound = np.argmin(np.abs(bin_centers-unbound_peak_location_guess-bound_peak_y_mean_shift))
 
     amp_guess_unbound = counts[idx_unbound]
     amp_guess_bound = counts[idx_bound]
@@ -1927,7 +2106,7 @@ def fit_single_gaussian_for_stdev(df, vid_num:int = 1, axis: str = "y", bins=500
     initial_guess = [amp_guess, mu_guess, sigma_guess]
 
     try:
-        popt, _ = curve_fit(gaussian, bin_centers, counts, p0=initial_guess, bounds=([0, 0, 1e-6], [3*amp_guess, 0.25, 0.25]))
+        popt, _ = curve_fit(gaussian, bin_centers, counts, p0=initial_guess, bounds=([0, 0, 1e-6], [float(len(data)), 0.25, 0.25]))
         amp, mu, sigma = popt
 
         if plot:
@@ -2019,14 +2198,17 @@ def mask_on_NS_particles(particles_df):
 
     return mask
 
-def mask_on_mean_position_shift(particles_df, ref_vid_num: int = 1, vid_num: int = 2, mean: float = 0, sigma: float = 0.02, n_sigma: float = 3):
-    shift_col = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
-    shift_values = particles_df[shift_col].values
+def mask_on_mean_position_shift(particles_df, ref_vid_num: int = 1, vid_num: int = 2, mean: float = 0, sigma: float = 0.02, n_sigma: float = 3, correction: str = "va"):
+    if correction == "va":
+        column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+    elif correction == "":
+        column = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
+    shift_values = particles_df[column].values
     mask = (shift_values < mean + n_sigma*sigma) & (shift_values > mean - n_sigma*sigma)
 
     return mask
 
-def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baseline: float = 0.02, delta_bound_peak: float = -0.25, n_sigma: float = 3, m_sigma:float = 3):
+def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baseline: float = 0.02, delta_bound_peak: float = -0.25, n_sigma: float = 3, stdev_y_window = (0.0, 0.2), stdev_x_window = (0.0, 0.2), unbound_peak_window = (-0.15, 0.15), correction: str = "va"):
     # (1)
     NS_particle_mask = mask_on_NS_particles(particles_df=particles_df)
 
@@ -2037,19 +2219,33 @@ def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baselin
     if vid_num == 1:
         mu_unbound = 0.00
     else:
+        # find right bin range for fitting
+        if correction == "va":
+            column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+        elif correction == "":
+            column = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
+
+        data = particles_df[column].dropna().values
+        data_mask = (data < unbound_peak_window[1]) & (data > unbound_peak_window[0])
+        windowed_data = data[data_mask]
+        windowed_mean = np.mean(windowed_data)
+        unbound_window_width = unbound_peak_window[1] - unbound_peak_window[0]
         _, mu_unbound, _ = fit_single_gaussian_y_shift(df=particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num, bins=100, plot=False,
-                                    bin_range=(-0.15, 0.15), sigma_guess=0.02)
+                                    bin_range=(windowed_mean-unbound_window_width/2, windowed_mean+unbound_window_width/2), sigma_guess = 0.02, correction=correction)
 
     unbound_position_shift_mask = mask_on_mean_position_shift(particles_df=particles_df, vid_num=vid_num,ref_vid_num=ref_vid_num,
-                                    mean=mu_unbound, sigma=sigma_baseline, n_sigma=n_sigma)
+                                    mean=mu_unbound, sigma=sigma_baseline, n_sigma=n_sigma, correction=correction)
     bound_position_shift_mask = mask_on_mean_position_shift(particles_df=particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num,
-                                    mean=mu_unbound+delta_bound_peak, sigma=sigma_baseline, n_sigma=n_sigma)
+                                    mean=mu_unbound+delta_bound_peak, sigma=sigma_baseline, n_sigma=n_sigma, correction=correction)
+
+    stdev_x_mask = mask_on_stdev_x_manual(particles_df=particles_df, vid_num=vid_num, window=stdev_x_window)
 
     # (3)
-    stdev_y_mask = mask_on_stdev_y_automated(particles_df=particles_df, vid_num=vid_num, m_sigma=m_sigma, filter="in", plot=False)
+    stdev_y_mask = mask_on_stdev_y_manual(particles_df=particles_df, vid_num=vid_num, window=stdev_y_window)
+    # stdev_y_mask = mask_on_stdev_y_automated(particles_df=particles_df, vid_num=vid_num, m_sigma=m_sigma, filter="in", plot=False)
 
-    unbound_mask = NS_particle_mask & unbound_position_shift_mask & stdev_y_mask
-    bound_mask = NS_particle_mask & bound_position_shift_mask & stdev_y_mask
+    unbound_mask = NS_particle_mask & unbound_position_shift_mask & stdev_y_mask & stdev_x_mask
+    bound_mask = NS_particle_mask & bound_position_shift_mask & stdev_y_mask & stdev_x_mask
 
     particles_df[f"({vid_num}) state"] = pd.Series([pd.NA] * len(particles_df), dtype='boolean')
     particles_df.loc[bound_mask, f"({vid_num}) state"] = True
@@ -2081,7 +2277,7 @@ def digitize_on_baseline_shift_manual(particles_df, vid_num: int = 2, ref_vid_nu
     add_num_bound_instances(particles_df)
 
 
-def add_num_bound_instances(particles_df, ref_vid_num = 1):
+def add_num_bound_instances(particles_df, ref_vid_num=1):
     state_cols = [col for col in particles_df.columns if col.endswith("state")] # need to digitize with same ref vid num
 
     for vid_num, _ in enumerate(state_cols, start=ref_vid_num):
@@ -2099,6 +2295,7 @@ def create_aggregate_digitized_df(particles_df):
     bound_list = []
     undetermined_list = []
     vid_nums = []
+    bound_instances_distributions = []
 
     state_cols = [col for col in particles_df.columns if col.endswith("state")]
 
@@ -2115,6 +2312,15 @@ def create_aggregate_digitized_df(particles_df):
         bound_list.append(bound_count)
         undetermined_list.append(undetermined_count)
 
+    ref_vid_num = np.min(vid_nums)
+    for vid_num in vid_nums:
+        counts = Counter(particles_df[f"({ref_vid_num}) to ({vid_num}) total bound instances"])
+
+        # Create dict from 0 to max value
+        max_val = particles_df[f"({ref_vid_num}) to ({vid_num}) total bound instances"].max()
+        bound_instances_distribution = {i: counts.get(i, 0) for i in range(max_val + 1)}
+        bound_instances_distributions.append(bound_instances_distribution)
+
     vid_nums = np.asarray(vid_nums)
     unbound_list = np.asarray(unbound_list)
     bound_list = np.asarray(bound_list)
@@ -2123,18 +2329,29 @@ def create_aggregate_digitized_df(particles_df):
     identified_list = bound_list+unbound_list
     total_list = bound_list+unbound_list+undetermined_list
 
+    confidence_intervals_identified = [calculate_confidence_intervals(n, k) for n, k in zip(identified_list, bound_list)]
+    confidence_intervals_total = [calculate_confidence_intervals(n, k) for n, k in zip(total_list, bound_list)]
 
+    # Unpack confidence intervals into lower and upper bound lists
+    ci_identified_low, ci_identified_high = zip(*confidence_intervals_identified)
+    ci_total_low, ci_total_high = zip(*confidence_intervals_total)
 
     # Stack columns and create DataFrame
     aggregate_df = pd.DataFrame(np.column_stack((vid_nums, total_list, identified_list,
                                                  undetermined_list, undetermined_list/total_list,
-                                                 bound_list, bound_list/identified_list, bound_list/total_list,
-                                                 unbound_list, unbound_list/identified_list, unbound_list/total_list)),
+                                                 bound_list,
+                                                 bound_list/identified_list, ci_identified_low, ci_identified_high,
+                                                 bound_list/total_list, ci_total_low, ci_total_high,
+                                                 unbound_list, unbound_list/identified_list, unbound_list/total_list,
+                                                 bound_instances_distributions)),
                                 columns=[
         "video number", "total number particles", "number identified particles",
         "number undetermined particles", "fraction total unidentified particles",
-        "number particles bound", "fraction identified particles bound", "fraction total particles bond",
-        "number particles unbound", "fraction identified particles unbound", "fraction total particles unbound"
+        "number particles bound",
+        "fraction identified particles bound", "95% CI lower (identified)", "95% CI upper (identified)",
+        "fraction total particles bound", "95% CI lower (total)", "95% CI upper (total)",
+        "number particles unbound", "fraction identified particles unbound", "fraction total particles unbound",
+        "bound instances distribution"
         ])
 
     # Cast specific columns to integers
@@ -2147,25 +2364,130 @@ def create_aggregate_digitized_df(particles_df):
     return aggregate_df
 
 
-def subset_aggregate_digitized_df(particles_df, aggregate_df, ref_vid_num: int, vid_nums: List[int]):
-    subset = particles_df[f"({ref_vid_num}) state"] == False
+def subset_aggregate_digitized_df(particles_df, aggregate_df, subsets: Tuple[List[int], List[int]], vid_list: List[int]):
+    open_subset_vids = subsets[0]
+    closed_subset_vids = subsets[1]
 
     subset_cols = [
-        f"subset ({ref_vid_num}) total number particles",
-        f"subset ({ref_vid_num}) number identified particles",
-        f"subset ({ref_vid_num}) number undetermined particles",
-        f"subset ({ref_vid_num}) fraction total undetermined particles",
-        f"subset ({ref_vid_num}) number particles bound",
-        f"subset ({ref_vid_num}) fraction identified particles bound",
-        f"subset ({ref_vid_num}) fraction total particles bound",
-        f"subset ({ref_vid_num}) number particles unbound",
-        f"subset ({ref_vid_num}) fraction identified particles unbound",
-        f"subset ({ref_vid_num}) fraction total particles unbound"
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) total number particles",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number identified particles",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number undetermined particles",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total undetermined particles",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number particles bound",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles bound",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI lower (identified)",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI upper (identified)",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total particles bound",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI lower (total)",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI upper (total)",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number particles unbound",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles unbound",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total particles unbound",
+        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) bound instances distribution"
+    ]
+
+    # pre-allocate cols with proper types
+    for col in subset_cols:
+        if "number" in col:  # specify as int
+            aggregate_df[col] = pd.Series([pd.NA] * len(aggregate_df), dtype="Int64")
+        elif "bound instances distribution" in col: # specify as dict
+            aggregate_df[col] = [{} for _ in range(len(aggregate_df))]
+        else:  # specify as float
+            aggregate_df[col] = np.nan
+
+    # build mask for subset
+    open_mask = pd.Series(True, index=particles_df.index)  # start with all True
+    for vid_num in open_subset_vids:
+        col = f"({vid_num}) state"
+        current_mask = particles_df[col].eq(False).fillna(False)
+        open_mask &= current_mask
+
+    closed_mask = pd.Series(True, index=particles_df.index)  # start with all True
+    for vid_num in closed_subset_vids:
+        col = f"({vid_num}) state"
+        current_mask = particles_df[col].eq(True).fillna(False)
+        closed_mask &= current_mask
+
+    subset_mask = open_mask & closed_mask
+    print("total particles in subset: ", subset_mask.sum())
+
+
+    old_per_particle_counts = pd.Series(0, index=particles_df[subset_mask].index, dtype=int)
+
+    for vid_num in vid_list:
+        current_state_col = f"({vid_num}) state"
+
+        unbound_count = (particles_df[subset_mask][current_state_col] == False).sum()
+        bound_count = (particles_df[subset_mask][current_state_col] == True).sum()
+        undetermined_count = particles_df[subset_mask][current_state_col].isna().sum()
+
+        total_count = unbound_count + bound_count + undetermined_count
+        identified_count = unbound_count + bound_count
+
+        ci_identified_low, ci_identified_high = calculate_confidence_intervals(identified_count, bound_count)
+        ci_total_low, ci_total_high = calculate_confidence_intervals(total_count, bound_count)
+
+        new_per_particle_counts = particles_df[subset_mask][f"({vid_num}) state"].fillna(False).astype(int)
+        per_particle_counts = new_per_particle_counts + old_per_particle_counts
+        counts = Counter(per_particle_counts)
+
+        old_per_particle_counts = per_particle_counts
+
+        # Create dict from 0 to max value
+        max_val = max(counts.keys(), default=0)
+        bound_instances_distribution = {i: counts.get(i, 0) for i in range(max_val + 1)}
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[0]] = total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[1]] = identified_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[2]] = undetermined_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[3]] = undetermined_count / total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[4]] = bound_count
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[5]] = bound_count / identified_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[6]] = ci_identified_low
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[7]] = ci_identified_high
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[8]] = bound_count / total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[9]] = ci_total_low
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[10]] = ci_total_high
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[11]] = unbound_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[12]] = unbound_count / identified_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[13]] = unbound_count / total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[14]] = [bound_instances_distribution]
+
+    aggregate_df = aggregate_df.copy()
+
+    return subset_mask
+
+# Deprecated, retained for use in old notebooks
+def open_subset_aggregate_digitized_df(particles_df, aggregate_df, ref_vid_num: int, vid_nums: List[int]):
+    subset = particles_df[f"({ref_vid_num}) state"] == False
+    # Deprecated, retained for use in old notebooks
+
+    subset_cols = [
+        f"open subset ({ref_vid_num}) total number particles",
+        f"open subset ({ref_vid_num}) number identified particles",
+        f"open subset ({ref_vid_num}) number undetermined particles",
+        f"open subset ({ref_vid_num}) fraction total undetermined particles",
+        f"open subset ({ref_vid_num}) number particles bound",
+        f"open subset ({ref_vid_num}) fraction identified particles bound",
+        f"open subset ({ref_vid_num}) 95% CI lower (identified)",
+        f"open subset ({ref_vid_num}) 95% CI upper (identified)",
+        f"open subset ({ref_vid_num}) fraction total particles bound",
+        f"open subset ({ref_vid_num}) 95% CI lower (total)",
+        f"open subset ({ref_vid_num}) 95% CI upper (total)",
+        f"open subset ({ref_vid_num}) number particles unbound",
+        f"open subset ({ref_vid_num}) fraction identified particles unbound",
+        f"open subset ({ref_vid_num}) fraction total particles unbound",
+        f"open subset ({ref_vid_num}) bound instances distribution"
     ]
 
     for col in subset_cols:
         if "number" in col:  # specify as int
             aggregate_df[col] = pd.Series([pd.NA] * len(aggregate_df), dtype="Int64")
+        elif "bound instances distribution" in col:
+            aggregate_df[col] = [{} for _ in range(len(aggregate_df))]
         else:  # specify as float
             aggregate_df[col] = np.nan
 
@@ -2180,28 +2502,427 @@ def subset_aggregate_digitized_df(particles_df, aggregate_df, ref_vid_num: int, 
         total_count = unbound_count+bound_count+undetermined_count
         identified_count = unbound_count+bound_count
 
+        ci_identified_low, ci_identified_high = calculate_confidence_intervals(identified_count, bound_count)
+        ci_total_low, ci_total_high = calculate_confidence_intervals(total_count, bound_count)
+
+
+
+
+
+        if vid_num == ref_vid_num:
+             per_particle_counts = particles_df[subset][f"({vid_num}) state"].fillna(False).astype(int)
+             counts = Counter(per_particle_counts)
+
+        else:
+            new_per_particle_counts = particles_df[subset][f"({vid_num}) state"].fillna(False).astype(int)
+            per_particle_counts = new_per_particle_counts+old_per_particle_counts
+            counts = Counter(per_particle_counts)
+
+
+        old_per_particle_counts = per_particle_counts
+
+        # Create dict from 0 to max value
+        max_val = max(counts.keys(), default=0)
+        bound_instances_distribution = {i: counts.get(i, 0) for i in range(max_val + 1)}
+
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[0]] = total_count
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[1]] = identified_count
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[2]] = undetermined_count
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[3]] = undetermined_count/total_count
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[4]] = bound_count
+
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[5]] = bound_count/identified_count
-        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[6]] = bound_count/total_count
-        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[7]] = unbound_count
-        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[8]] = unbound_count / identified_count
-        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[9]] = unbound_count / total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[6]] = ci_identified_low
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[7]] = ci_identified_high
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[8]] = bound_count/total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[9]] = ci_total_low
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[10]] = ci_total_high
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[11]] = unbound_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[12]] = unbound_count / identified_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[13]] = unbound_count / total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[14]] = [bound_instances_distribution]
+
+
+# Deprecated, retained for use in old notebooks
+def closed_subset_aggregate_digitized_df(particles_df, aggregate_df, ref_vid_num: int, vid_nums: List[int]):
+    subset = particles_df[f"({ref_vid_num}) state"] == True
+    # Deprecated, retained for use in old notebooks
+
+    subset_cols = [
+        f"closed subset ({ref_vid_num}) total number particles",
+        f"closed subset ({ref_vid_num}) number identified particles",
+        f"closed subset ({ref_vid_num}) number undetermined particles",
+        f"closed subset ({ref_vid_num}) fraction total undetermined particles",
+        f"closed subset ({ref_vid_num}) number particles bound",
+        f"closed subset ({ref_vid_num}) fraction identified particles bound",
+        f"closed subset ({ref_vid_num}) 95% CI lower (identified)",
+        f"closed subset ({ref_vid_num}) 95% CI upper (identified)",
+        f"closed subset ({ref_vid_num}) fraction total particles bound",
+        f"closed subset ({ref_vid_num}) 95% CI lower (total)",
+        f"closed subset ({ref_vid_num}) 95% CI upper (total)",
+        f"closed subset ({ref_vid_num}) number particles unbound",
+        f"closed subset ({ref_vid_num}) fraction identified particles unbound",
+        f"closed subset ({ref_vid_num}) fraction total particles unbound",
+        f"closed subset ({ref_vid_num}) bound instances distribution"
+    ]
+
+    for col in subset_cols:
+        if "number" in col:  # specify as int
+            aggregate_df[col] = pd.Series([pd.NA] * len(aggregate_df), dtype="Int64")
+        elif "bound instances distribution" in col:
+            aggregate_df[col] = [{} for _ in range(len(aggregate_df))]
+        else:  # specify as float
+            aggregate_df[col] = np.nan
+
+    vid_list = [ref_vid_num] + vid_nums
+    for vid_num in vid_list:
+        current_state_col = f"({vid_num}) state"
+
+        unbound_count = (particles_df[subset][current_state_col] == False).sum()
+        bound_count = (particles_df[subset][current_state_col] == True).sum()
+        undetermined_count = particles_df[subset][current_state_col].isna().sum()
+
+        total_count = unbound_count + bound_count + undetermined_count
+        identified_count = unbound_count + bound_count
+
+        ci_identified_low, ci_identified_high = calculate_confidence_intervals(identified_count, bound_count)
+        ci_total_low, ci_total_high = calculate_confidence_intervals(total_count, bound_count)
+
+        if vid_num == ref_vid_num:
+            per_particle_counts = particles_df[subset][f"({vid_num}) state"].fillna(False).astype(int)
+            counts = Counter(per_particle_counts)
+
+        else:
+            new_per_particle_counts = particles_df[subset][f"({vid_num}) state"].fillna(False).astype(int)
+            per_particle_counts = new_per_particle_counts + old_per_particle_counts
+            counts = Counter(per_particle_counts)
+
+        old_per_particle_counts = per_particle_counts
+
+        # Create dict from 0 to max value
+        max_val = max(counts.keys(), default=0)
+        bound_instances_distribution = {i: counts.get(i, 0) for i in range(max_val + 1)}
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[0]] = total_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[1]] = identified_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[2]] = undetermined_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[3]] = undetermined_count / total_count if total_count > 0 else 0
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[4]] = bound_count
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[5]] = bound_count / identified_count if identified_count >0 else 0
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[6]] = ci_identified_low
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[7]] = ci_identified_high
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[8]] = bound_count / total_count if total_count > 0 else 0
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[9]] = ci_total_low
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[10]] = ci_total_high
+
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[11]] = unbound_count
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[12]] = unbound_count / identified_count if identified_count >0 else 0
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[13]] = unbound_count / total_count if total_count > 0 else 0
+        aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[14]] = [bound_instances_distribution]
+
+
+def calculate_confidence_intervals(n: int, k: int):
+    """Calculates 95% CI for normal approximation of binomial distribution"""
+    if n == 0:
+        return np.nan, np.nan
+    p_hat = k/n
+    standard_error = np.sqrt((p_hat*(1-p_hat))/n)
+    confidence_interval = (p_hat - 1.96*standard_error, p_hat + 1.96*standard_error)
+
+    return confidence_interval
+
+
+def plot_particle_state_over_time(particles_df, vid_nums):
+
+    particles_df = particles_df[mask_on_NS_particles(particles_df)]  # remove fiducials
+
+    # Step 1: Identify the state columns
+    state_cols = []
+    for vid_num in vid_nums:
+        state_col = f"({vid_num}) state"
+        state_cols.append(state_col)
+
+    # Step 2: Convert to numeric for visualization: False → 0, True → 1, NaN → 2
+    state_numeric = particles_df[state_cols].copy()
+
+    # Convert all columns to object first to prevent issues from Pandas' nullable boolean dtype
+    state_numeric = state_numeric.astype(object)
+
+    # Replace values safely
+    state_numeric = state_numeric.replace({False: 0, True: 1, np.nan: 2}).astype(int)
+
+    # Step 3: Convert to NumPy array for plotting
+    state_matrix = state_numeric.to_numpy()
+
+    # Get particle numbers from the DataFrame
+    particle_numbers = particles_df["Particle Number"].tolist()
+
+    # Plot
+    cmap = ListedColormap(['blue', 'red', 'gray'])
+    plt.figure(figsize=(8, 80))  # Adjust as needed
+    plt.imshow(state_matrix, cmap=cmap, aspect='auto')
+
+    # Labeling
+    plt.xlabel("Video Number")
+    plt.ylabel("Particle Number")
+    plt.title("Particle State vs Video Number")
+    plt.colorbar(ticks=[0, 1, 2], label='State (0=Unbound, 1=Bound, 2=Undetermined)')
+
+    # Add vid num labels on x-axis
+    plt.xticks(ticks=range(len(vid_nums)), labels=vid_nums)
+
+    # Add particle number labels on y-axis
+    step = 10
+    plt.yticks(ticks=range(0, len(particle_numbers), step),
+               labels=particle_numbers[::step])
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_binding_instances_histogram(dict):
+    # Extract keys and values
+    keys = list(dict.keys())
+    values = list(dict.values())
+
+    # Plot
+    plt.figure(figsize=(8, 5))
+    plt.bar(keys, values, color='steelblue', edgecolor='black')
+    plt.xlabel("Number of Binding Instances in Window")
+    plt.ylabel("Frequency")
+    plt.title("Histogram of binding instances")
+    plt.xticks(keys)
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+    return
+
+
+def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, flow, duration, particle_selection: str = "identified"):
+
+
+    style_inter = {
+        "font.family": "Arial",
+        "font.size": 14,
+        "axes.labelsize": 20,
+        "axes.titlesize": 24,
+        "legend.fontsize": 18,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+    }
+
+    plt.figure(figsize=(12, 4))
+
+    time_step = 1  # s
+
+    time_array = np.arange(0,duration*60, time_step)
+    target_array = gen_target(steps=target, duration=duration, time_step=time_step)
+    flow_array = gen_mode(steps=flow, duration=duration, time_step=time_step)
+
+    frac_bound = []
+    frac_unbound = []
+    frac_unidentified = []
+    frac_bound_CI_lower = []
+    frac_bound_CI_upper = []
+
+    for vid_num in vid_nums:
+        if particle_selection == "identified":
+            frac_bound.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["fraction identified particles bound"].values[0])
+            frac_unbound.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["fraction identified particles unbound"].values[0])
+            frac_unidentified.append(0.00)
+            frac_bound_CI_lower.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["95% CI lower (identified)"].values[0])
+            frac_bound_CI_upper.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["95% CI upper (identified)"].values[0])
+
+        elif particle_selection == "total":
+            frac_bound.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["fraction total particles bound"].values[0])
+            frac_unbound.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["fraction total particles unbound"].values[
+                    0])
+            frac_unidentified.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["fraction total unidentified particles"].values[
+                    0]
+            )
+            frac_bound_CI_lower.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["95% CI lower (total)"].values[0])
+            frac_bound_CI_upper.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["95% CI upper (total)"].values[0])
+
+        else:
+            print("particle selection not properly specified!")
+            return
+    bound_error_lower = list(np.asarray(frac_bound)-np.asarray(frac_bound_CI_lower))
+    bound_error_higher = list(np.asarray(frac_bound_CI_upper)-np.asarray(frac_bound))
+
+
+    with plt.rc_context(style_inter):
+        fig, (ax_top, ax_bot) = plt.subplots(
+            2, 1, figsize=(12, 6),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1], "hspace": 0.15}
+        )
+
+
+        ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4, color='#E50000', label='fraction closed particles (state C)')
 
 
 
-def compute_subset_new_binders(particles_df, vid_num: int = 2, ref_vid_num: int = 1):
-    start_unbound_total = (particles_df[f"({ref_vid_num}) state"] == False).sum()
+        ax_top.fill_between(time_array/60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1, label='flow on')
 
-    end_bound_total = (
-                particles_df[particles_df[f"({ref_vid_num}) state"] == False][f"({vid_num}) state"] == True).sum()
+        ax_top.set_ylabel('state fraction', color='black')
+        ax_top.set_ylim(0, 1.05)
+        ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+        ax_top.legend(loc='upper left')
+        ax_top.grid(True)
 
-    fraction_new_binders = end_bound_total / start_unbound_total
 
-    return start_unbound_total, end_bound_total, fraction_new_binders
+        ax_bot.semilogy(time_array/60, target_array, label='target', color='black')
+        ax_bot.set_ylabel('[T] (M)')
+        ax_bot.grid(True, axis='x', which='both')
+        ax_bot.set_yscale('log')
+        ax_bot.set_xlabel('time (minutes)')
+        ax_bot.set_xlim(time_array[0]/60, time_array[-1]/60)
+
+
+        plt.show()
+
+
+def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, target, flow, duration, subsets_strings: List[str], subsets_videos: List[List[int]], particle_selection: str = "identified"):
+
+    style_inter = {
+        "font.family": "Arial",
+        "font.size": 14,
+        "axes.labelsize": 20,
+        "axes.titlesize": 24,
+        "legend.fontsize": 18,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+    }
+
+    # verify subsets_videos contain a matching number of videos to vid_nums
+    vid_nums_counts = Counter(vid_nums)
+    subsets_videos_counts = Counter(x for sub in subsets_videos for x in sub)
+    perfect_overlap = vid_nums_counts == subsets_videos_counts
+
+    if perfect_overlap == False:
+        print("vid_nums and subsets_videos do not perfectly overlap!")
+        return
+
+    plt.figure(figsize=(12, 4))
+
+    time_step = 1  # s
+
+    time_array = np.arange(0,duration*60, time_step)
+    target_array = gen_target(steps=target, duration=duration, time_step=time_step)
+    flow_array = gen_mode(steps=flow, duration=duration, time_step=time_step)
+
+    frac_bound = []
+    frac_unbound = []
+    frac_unidentified = []
+    frac_bound_CI_lower = []
+    frac_bound_CI_upper = []
+
+    for idx, sub_string in enumerate(subsets_strings,start=0):
+        for vid_num in subsets_videos[idx]:
+
+            if particle_selection == "identified":
+                frac_bound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction identified particles bound"].values[0])
+                frac_unbound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction identified particles unbound"].values[0])
+                frac_unidentified.append(0.00)
+                frac_bound_CI_lower.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI lower (identified)"].values[0])
+                frac_bound_CI_upper.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI upper (identified)"].values[0])
+
+            elif particle_selection == "total":
+                frac_bound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction total particles bound"].values[0])
+                frac_unbound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction total particles unbound"].values[
+                        0])
+                frac_unidentified.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction total unidentified particles"].values[
+                        0]
+                )
+                frac_bound_CI_lower.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI lower (total)"].values[0])
+                frac_bound_CI_upper.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI upper (total)"].values[0])
+
+            else:
+                print("particle selection not properly specified!")
+                return
+
+    bound_error_lower = list(np.asarray(frac_bound)-np.asarray(frac_bound_CI_lower))
+    bound_error_higher = list(np.asarray(frac_bound_CI_upper)-np.asarray(frac_bound))
+
+
+    with plt.rc_context(style_inter):
+        fig, (ax_top, ax_bot) = plt.subplots(
+            2, 1, figsize=(12, 6),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1], "hspace": 0.15}
+        )
+
+
+        ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4, color='#E50000', label='fraction closed particles (state C)')
+
+
+
+        ax_top.fill_between(time_array/60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1, label='flow on')
+
+        ax_top.set_ylabel('state fraction', color='black')
+        ax_top.set_ylim(0, 1.05)
+        ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+        ax_top.legend(loc='upper left')
+        ax_top.grid(True)
+
+
+        ax_bot.semilogy(time_array/60, target_array, label='target', color='black')
+        ax_bot.set_ylabel('[T] (M)')
+        ax_bot.grid(True, axis='x', which='both')
+        ax_bot.set_yscale('log')
+        ax_bot.set_xlabel('time (minutes)')
+        ax_bot.set_xlim(time_array[0]/60, time_array[-1]/60)
+
+
+        plt.show()
+
+
+
+
+
+
+def gen_target(steps: np.ndarray, duration: int, time_step: float):
+    target = np.zeros(len(np.arange(0,duration*60,time_step)))
+
+    for s in steps:
+        start = int(round(60 * s[0] / time_step))
+        stop = int(round(60 * s[1] / time_step))
+        target[start:stop] += s[2]
+
+    return target
+
+
+# mechanical actuation, i.e. forced vs unforced
+def gen_mode(steps: np.ndarray, duration: int, time_step: float):
+    mode = np.zeros(len(np.arange(0,duration*60,time_step)))
+
+    for s in steps:
+        start = int(round(60*s[0] / time_step))
+        stop = int(round(60*s[1] / time_step))
+        mode[start:stop] = 1
+
+    return mode
 
 
 def combine_particle_dataframes(dfs: List[pd.DataFrame]) -> pd.DataFrame:
@@ -2213,3 +2934,280 @@ def combine_particle_dataframes(dfs: List[pd.DataFrame]) -> pd.DataFrame:
     if not dfs:
         return pd.DataFrame()  # or raise ValueError("No dataframes provided")
     return pd.concat(dfs, ignore_index=True)
+
+def plot_particle_motion(particles_df, vid_num: int = 1, exposure_time: float = 0.100):
+
+    n_cols = 10
+    n_subplots = len(particles_df)
+
+    # Compute the number of rows needed
+    n_rows_needed = int(np.ceil(n_subplots / n_cols))
+
+    fig, axes = plt.subplots(n_rows_needed, n_cols, figsize=(25, 2 * n_rows_needed), constrained_layout=True)
+
+    # Flatten axes for easy indexing (even if 1D or 2D)
+    axes = axes.flatten()
+
+    # Plot each list on its own subplot
+    for i, (idx, row) in enumerate(particles_df.iterrows()):
+        if row[f"({vid_num}) state"] is True:
+            color = "red"
+        elif row[f"({vid_num}) state"] is False:
+            color = "blue"
+        else:
+            color = "gray"
+        data = row[f"({vid_num}) y positions"]
+        num_frames = len(data)
+        t = [i*exposure_time for i in range(num_frames)]
+
+        particle_num = row["Particle Number"]
+        axes[i].plot(t, data, color=color)
+        axes[i].set_title(f"Particle {particle_num}")
+        axes[i].grid(True)
+
+    # Hide any unused axes
+    for j in range(i + 1, len(axes)):
+        axes[j].axis('off')
+
+    plt.show()
+
+
+## Freemotion Functions ##
+Point = Tuple[float, float]
+Circle = Tuple[Point, float]  # ((cx, cy), r)
+
+# ---------- basic geometry helpers ----------
+
+def _dist(a: Point, b: Point) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+def _circle_from_2(a: Point, b: Point) -> Circle:
+    cx, cy = (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5
+    r = _dist(a, b) * 0.5
+    return (cx, cy), r
+
+def _circle_from_3(a: Point, b: Point, c: Point) -> Optional[Circle]:
+    # Circumcircle; return None if collinear/numerically unstable
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    d = 2 * (ax*(by - cy) + bx*(cy - ay) + cx*(ay - by))
+    eps = 1e-14
+    if abs(d) < eps:
+        return None
+    ax2ay2 = ax*ax + ay*ay
+    bx2by2 = bx*bx + by*by
+    cx2cy2 = cx*cx + cy*cy
+    ux = (ax2ay2*(by - cy) + bx2by2*(cy - ay) + cx2cy2*(ay - by)) / d
+    uy = (ax2ay2*(cx - bx) + bx2by2*(ax - cx) + cx2cy2*(bx - ax)) / d
+    r = math.hypot(ux - ax, uy - ay)
+    return (ux, uy), r
+
+def _is_in_circle(p: Point, c: Circle, tol: float = 1e-12) -> bool:
+    (cx, cy), r = c
+    # include a tiny tolerance so boundary noise is inside
+    return _dist(p, (cx, cy)) <= r + max(1e-12, tol * max(1.0, r))
+
+# ---------- Welzl’s algorithm ----------
+
+def _mec_with_boundary(points: List[Point], R: List[Point], n: int) -> Circle:
+    # Base cases
+    if n == 0 or len(R) == 3:
+        if len(R) == 0:
+            return ((0.0, 0.0), 0.0)
+        if len(R) == 1:
+            return (R[0], 0.0)
+        if len(R) == 2:
+            return _circle_from_2(R[0], R[1])
+        # len(R) == 3
+        c3 = _circle_from_3(R[0], R[1], R[2])
+        if c3 is None:
+            # If collinear: enclosing circle is from the diameter of the endpoints
+            best = None
+            for i in range(3):
+                for j in range(i+1, 3):
+                    cand = _circle_from_2(R[i], R[j])
+                    if all(_is_in_circle(p, cand) for p in R):
+                        best = cand if best is None or cand[1] < best[1] else best
+            return best
+        return c3
+
+    p = points[n - 1]
+    c = _mec_with_boundary(points, R, n - 1)
+    if _is_in_circle(p, c):
+        return c
+    # p is outside current circle; it must lie on the boundary of the new circle
+    return _mec_with_boundary(points, R + [p], n - 1)
+
+def minimum_enclosing_circle(points: Iterable[Point], seed: Optional[int] = 0) -> Circle:
+    """Return ((cx, cy), r) for the unique smallest circle enclosing all points."""
+    P = list(points)
+    if len(P) == 0:
+        return ((0.0, 0.0), 0.0)
+    # Randomize for expected O(n)
+    rng = random.Random(seed)
+    rng.shuffle(P)
+    return _mec_with_boundary(P, [], len(P))
+
+# ---------- convenience wrapper for your experiment ----------
+
+def fit_motion_circle(
+    x: Iterable[float],
+    y: Iterable[float],
+    drop_top_outlier_frac: float = 0.0,
+    seed: int = 0,
+) -> Circle:
+    """
+    Returns center (cx, cy) and radius r in the same units as inputs (pixels),
+    unless pixel_size_um is provided, in which case results are converted to microns.
+    add_margin_um can pad the radius (e.g., for localization σ).
+    drop_top_outlier_frac (0..0.5) removes the farthest fraction before fitting.
+    """
+    pts = list(zip(x, y))
+    if len(pts) == 0:
+        return ((0.0, 0.0), 0.0)
+
+    # Optional robustification: remove extreme outliers before MEC
+    if drop_top_outlier_frac > 0:
+        # First coarse circle to judge distances
+        c0 = minimum_enclosing_circle(pts, seed=seed)
+        dists = [ _dist(p, c0[0]) for p in pts ]
+        keep = int(round((1.0 - drop_top_outlier_frac) * len(pts)))
+        idx_sorted = sorted(range(len(pts)), key=lambda i: dists[i])
+        pts = [pts[i] for i in idx_sorted[:keep]]
+
+    (cx, cy), r = minimum_enclosing_circle(pts, seed=seed)
+
+    return (cx, cy), r
+
+def add_minimum_enclosing_circle_cols(particles_df, image_paths: List[str],drop_top_outlier_frac=0.0, seed=0):
+    def _fit_row(row, vid_num, drop_top_outlier_frac=0.0, seed=0):
+        # Grab lists/arrays from the row
+        x = np.asarray(row[f"({vid_num}) x positions"], dtype=float)
+        y = np.asarray(row[f"({vid_num}) y positions"], dtype=float)
+
+
+        # Keep only finite samples
+        m = np.isfinite(x) & np.isfinite(y)
+        x, y = x[m], y[m]
+        if x.size == 0:
+            return pd.Series(
+                {f"({vid_num}) MEC radius": np.nan, f"({vid_num} MEC center": (np.nan, np.nan)}
+            )
+
+        (cx, cy), r = fit_motion_circle(
+            x, y, drop_top_outlier_frac=drop_top_outlier_frac, seed=seed
+        )
+        return pd.Series({f"({vid_num}) MEC radius": r, f"({vid_num}) MEC center": (cx, cy)})
+
+    # all_new = []
+    for vid_num, _ in enumerate(image_paths, start=1):
+
+        MEC_cols = particles_df.apply(
+            _fit_row,
+            axis=1,
+            result_type="expand",
+            vid_num=vid_num,
+            drop_top_outlier_frac=drop_top_outlier_frac,
+            seed=seed,
+        )
+
+        # Merge results back
+        particles_df = pd.concat([particles_df, MEC_cols], axis=1)
+
+    # defragment
+    particles_df = particles_df.copy()
+
+    return particles_df
+
+def analyze_video_free_motion(df, video_num, nbins: int, range_stdev = (0, 0.2), range_MEC_radii = (0.0, 6.0)):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))  # 1 row, 3 columns
+
+    # Plot histograms for each column
+    title_fontsize = 14
+    axis_fontisze = 12
+    tick_fontsize = 10
+
+
+    axes[0].hist(df[f'({video_num}) stdev x position'], bins=nbins, range=range_stdev, edgecolor='black', alpha=0.7)
+    axes[0].set_title(f'Video {video_num} Histogram of Standard Deviation in X', fontsize=title_fontsize)
+    axes[0].set_xlabel('Pixels', fontsize=axis_fontisze)
+    axes[0].set_ylabel('Frequency', fontsize=axis_fontisze)
+    axes[0].tick_params(axis='both', which='major', labelsize=tick_fontsize)
+    axes[0].grid(True)
+
+    axes[1].hist(df[f'({video_num}) stdev y position'], bins=nbins, range=range_stdev, edgecolor='black', alpha=0.7)
+    axes[1].set_title(f'Video {video_num} Histogram of Standard Deviation in Y', fontsize=title_fontsize)
+    axes[1].set_xlabel('Pixels', fontsize=axis_fontisze)
+    axes[1].set_ylabel('Frequency', fontsize=axis_fontisze)
+    axes[1].tick_params(axis='both', which='major', labelsize=tick_fontsize)
+    axes[1].grid(True)
+
+    axes[2].hist(df[f'({video_num}) MEC radius'], bins=nbins, range=range_MEC_radii, edgecolor='black', alpha=0.7)
+    axes[2].set_title(f'Video {video_num} Histogram of MEC radii for position data', fontsize=title_fontsize)
+    axes[2].set_xlabel('Pixels', fontsize=axis_fontisze)
+    axes[2].set_ylabel('Frequency', fontsize=axis_fontisze)
+    axes[2].tick_params(axis='both', which='major', labelsize=tick_fontsize)
+    axes[2].grid(True)
+
+    # Adjust layout
+    plt.tight_layout()
+    plt.show()
+
+def plot_points_and_circle(
+    points: Iterable[Point],
+    circle: Circle,
+    boundary: Optional[List[Point]] = None,
+    title: Optional[str] = None,
+):
+    """
+    Plot 2D points and a circle.
+
+    Args:
+        points: iterable of (x, y)
+        circle: ((cx, cy), r)
+        boundary: optional list of points that define the circle boundary (≤3), highlighted with 'x'
+        title: optional plot title
+    """
+    points = list(points)
+    (cx, cy), r = circle
+
+    # Scatter points
+    xs, ys = zip(*points) if points else ([], [])
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(xs, ys, s=40, label="points")
+
+    # Circle perimeter
+    theta = [t * math.pi / 180.0 for t in range(361)]
+    cxs = [cx + r * math.cos(t) for t in theta]
+    cys = [cy + r * math.sin(t) for t in theta]
+    ax.plot(cxs, cys, label="circle")
+
+    # Circle center
+    ax.scatter([cx], [cy], marker="x", s=60, label="center")
+
+    # Optional boundary points
+    if boundary:
+        bx, by = zip(*boundary)
+        ax.scatter(bx, by, marker="x", s=80, label="boundary")
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    if title:
+        ax.set_title(title)
+    ax.legend()
+    plt.show()
+
+
+def truncate_positions(df, vid_num, new_length: int):
+    x_pos_col = f"({vid_num}) x positions"
+    y_pos_col = f"({vid_num}) y positions"
+
+    df[x_pos_col] = df[x_pos_col].str.slice(stop=new_length)
+    df[y_pos_col] = df[y_pos_col].str.slice(stop=new_length)
+
+    df = df.copy
+
+    return df
+
