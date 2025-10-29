@@ -4,6 +4,8 @@ import numpy as np
 import tifffile
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
+from matplotlib import cm, colors as mpl_colors
+
 
 from scipy.spatial.distance import pdist, squareform
 from typing import List, Tuple, Optional, Dict, Any, Iterable
@@ -682,7 +684,7 @@ def compute_stdev_position(position_list):
 #                                 except (RuntimeError, ValueError) as e:
 #                                     print(f"Fit failed for particle at index {index}: {e}")
 
-def add_video_average_corrected_mean_position_cols(particles_df, image_paths: List[str], ref_vid_num: int = 1, print_rbt: bool = False):
+def add_video_average_corrected_mean_position_cols(particles_df, image_paths: List[str], ref_vid_num: int = 1, print_rbt: bool = False, rotate: bool = True):
     all_new = []
     for vid_num, path in enumerate(image_paths, start=1):
         x_col_corrected = f"({vid_num}) mean x position va corrected"
@@ -711,7 +713,13 @@ def add_video_average_corrected_mean_position_cols(particles_df, image_paths: Li
             raise ValueError(f"Not enough valid fiducials after dropping nonfinite data: only {P1.shape[1]} left.")
 
         A = rigid_transform_least_squares(P1, P2)
-        P3_corrected = apply_rigid_transform(A, P3)
+
+        if rotate:
+            P3_corrected = apply_rigid_transform(A, P3)
+        else:
+            t = A[:, 2:3]  # translation column (2x1)
+            A_no_rot = np.hstack([np.eye(2), t])  # [I | t], 2x3
+            P3_corrected = apply_rigid_transform(A_no_rot, P3)
 
         x_pos_mean_corrected = P3_corrected[0, :]  # First row → x values
         y_pos_mean_corrected = P3_corrected[1, :]  # Second row → y values
@@ -1656,6 +1664,7 @@ def plot_mean_position_shift_histograms(df, correction: str, ref_vid_num: int = 
         fig.suptitle(f"Mean Position Shift between ({ref_vid_num}) and ({vid_num}), {correction} correction", fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
+        plt.close(fig)
 
     elif correction == "":
         fig, axs = plt.subplots(1, 2, figsize=(18, 3))
@@ -1689,6 +1698,7 @@ def plot_mean_position_shift_histograms(df, correction: str, ref_vid_num: int = 
                      fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
+        plt.close(fig)
 
     else:
         print("correction type improperly speficied. Must be 'va' or ''. ")
@@ -2242,7 +2252,6 @@ def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baselin
 
     # (3)
     stdev_y_mask = mask_on_stdev_y_manual(particles_df=particles_df, vid_num=vid_num, window=stdev_y_window)
-    # stdev_y_mask = mask_on_stdev_y_automated(particles_df=particles_df, vid_num=vid_num, m_sigma=m_sigma, filter="in", plot=False)
 
     unbound_mask = NS_particle_mask & unbound_position_shift_mask & stdev_y_mask & stdev_x_mask
     bound_mask = NS_particle_mask & bound_position_shift_mask & stdev_y_mask & stdev_x_mask
@@ -2727,6 +2736,7 @@ def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, 
     frac_unidentified = []
     frac_bound_CI_lower = []
     frac_bound_CI_upper = []
+    num_particles_identified = []
 
     for vid_num in vid_nums:
         if particle_selection == "identified":
@@ -2739,6 +2749,9 @@ def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, 
                 aggregate_df[aggregate_df["video number"] == vid_num]["95% CI lower (identified)"].values[0])
             frac_bound_CI_upper.append(
                 aggregate_df[aggregate_df["video number"] == vid_num]["95% CI upper (identified)"].values[0])
+            num_particles_identified.append(
+                aggregate_df[aggregate_df["video number"] == vid_num]["number identified particles"].values[0])
+
 
         elif particle_selection == "total":
             frac_bound.append(
@@ -2763,35 +2776,68 @@ def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, 
 
 
     with plt.rc_context(style_inter):
-        fig, (ax_top, ax_bot) = plt.subplots(
-            2, 1, figsize=(12, 6),
-            sharex=True,
-            gridspec_kw={"height_ratios": [3, 1], "hspace": 0.15}
-        )
+        if particle_selection == "total":
+            fig, (ax_top, ax_bot) = plt.subplots(
+                2, 1, figsize=(12, 6),
+                sharex=True,
+                gridspec_kw={"height_ratios": [3, 1], "hspace": 0.25}
+            )
 
 
-        ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4, color='#E50000', label='fraction closed particles (state C)')
+            ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4, color='#E50000', label='fraction closed particles (state C)')
 
 
 
-        ax_top.fill_between(time_array/60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1, label='flow on')
+            ax_top.fill_between(time_array/60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1, label='flow on')
 
-        ax_top.set_ylabel('state fraction', color='black')
-        ax_top.set_ylim(0, 1.05)
-        ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-        ax_top.legend(loc='upper left')
-        ax_top.grid(True)
-
-
-        ax_bot.semilogy(time_array/60, target_array, label='target', color='black')
-        ax_bot.set_ylabel('[T] (M)')
-        ax_bot.grid(True, axis='x', which='both')
-        ax_bot.set_yscale('log')
-        ax_bot.set_xlabel('time (minutes)')
-        ax_bot.set_xlim(time_array[0]/60, time_array[-1]/60)
+            ax_top.set_ylabel('state fraction', color='black')
+            ax_top.set_ylim(0, 1.05)
+            ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+            # ax_top.legend(loc='upper left')
+            ax_top.grid(True)
 
 
-        plt.show()
+            ax_bot.semilogy(time_array/60, target_array, label='target', color='black')
+            ax_bot.set_ylabel('[T] (M)')
+            ax_bot.grid(True, axis='x', which='both')
+            ax_bot.set_yscale('log')
+            ax_bot.set_xlabel('time (minutes)')
+            ax_bot.set_xlim(time_array[0]/60, time_array[-1]/60)
+
+            plt.show()
+        if particle_selection == "identified":
+            fig, (ax_top, ax_mid, ax_bot) = plt.subplots(
+                3, 1, figsize=(14, 6),
+                sharex=True,
+                gridspec_kw={"height_ratios": [6, 2, 1], "hspace": 0.15}
+            )
+
+            ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4,
+                            color='#E50000', label='fraction closed particles (state C)')
+
+            ax_top.fill_between(time_array / 60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1,
+                                label='flow on')
+
+            ax_top.set_ylabel('state fraction', color='black')
+            ax_top.set_ylim(0, 1.05)
+            ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+            # ax_top.legend(loc='upper left')
+            ax_top.grid(True)
+
+            ax_mid.semilogy(time_array / 60, target_array, label='target', color='black')
+            ax_mid.set_ylabel('[T] (M)')
+            ax_mid.grid(True, axis='x', which='both')
+            ax_mid.set_yscale('log')
+            # ax_mid.set_xlabel('time (minutes)')
+            ax_mid.set_xlim(time_array[0] / 60, time_array[-1] / 60)
+
+            ax_bot.plot(vid_times, num_particles_identified, color = "black", label="number of particles")
+            # ax_bot.set_ylabel('number of particles', color='black', fontsize=10)
+            ax_bot.legend(loc='upper right', fontsize = 10)
+            ax_bot.set_xlabel('time (minutes)')
+            ax_bot.set_xlim(time_array[0] / 60, time_array[-1] / 60)
+
+
 
 
 def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, target, flow, duration, subsets_strings: List[str], subsets_videos: List[List[int]], particle_selection: str = "identified"):
@@ -2828,6 +2874,8 @@ def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, 
     frac_unidentified = []
     frac_bound_CI_lower = []
     frac_bound_CI_upper = []
+    num_particles_identified = []
+
 
     for idx, sub_string in enumerate(subsets_strings,start=0):
         for vid_num in subsets_videos[idx]:
@@ -2842,6 +2890,8 @@ def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, 
                     aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI lower (identified)"].values[0])
                 frac_bound_CI_upper.append(
                     aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI upper (identified)"].values[0])
+                num_particles_identified.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"number identified particles"].values[0])
 
             elif particle_selection == "total":
                 frac_bound.append(
@@ -2866,40 +2916,68 @@ def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, 
     bound_error_higher = list(np.asarray(frac_bound_CI_upper)-np.asarray(frac_bound))
 
 
+
     with plt.rc_context(style_inter):
-        fig, (ax_top, ax_bot) = plt.subplots(
-            2, 1, figsize=(12, 6),
-            sharex=True,
-            gridspec_kw={"height_ratios": [3, 1], "hspace": 0.15}
-        )
+        if particle_selection == "total":
+            fig, (ax_top, ax_bot) = plt.subplots(
+                2, 1, figsize=(12, 6),
+                sharex=True,
+                gridspec_kw={"height_ratios": [3, 1], "hspace": 0.25}
+            )
 
 
-        ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4, color='#E50000', label='fraction closed particles (state C)')
-
-
-
-        ax_top.fill_between(time_array/60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1, label='flow on')
-
-        ax_top.set_ylabel('state fraction', color='black')
-        ax_top.set_ylim(0, 1.05)
-        ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-        ax_top.legend(loc='upper left')
-        ax_top.grid(True)
-
-
-        ax_bot.semilogy(time_array/60, target_array, label='target', color='black')
-        ax_bot.set_ylabel('[T] (M)')
-        ax_bot.grid(True, axis='x', which='both')
-        ax_bot.set_yscale('log')
-        ax_bot.set_xlabel('time (minutes)')
-        ax_bot.set_xlim(time_array[0]/60, time_array[-1]/60)
-
-
-        plt.show()
+            ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4, color='#E50000', label='fraction closed particles (state C)')
 
 
 
+            ax_top.fill_between(time_array/60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1, label='flow on')
 
+            ax_top.set_ylabel('state fraction', color='black')
+            ax_top.set_ylim(0, 1.05)
+            ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+            # ax_top.legend(loc='upper left')
+            ax_top.grid(True)
+
+
+            ax_bot.semilogy(time_array/60, target_array, label='target', color='black')
+            ax_bot.set_ylabel('[T] (M)')
+            ax_bot.grid(True, axis='x', which='both')
+            ax_bot.set_yscale('log')
+            ax_bot.set_xlabel('time (minutes)')
+            ax_bot.set_xlim(time_array[0]/60, time_array[-1]/60)
+
+            plt.show()
+        if particle_selection == "identified":
+            fig, (ax_top, ax_mid, ax_bot) = plt.subplots(
+                3, 1, figsize=(14, 6),
+                sharex=True,
+                gridspec_kw={"height_ratios": [6, 2, 1], "hspace": 0.15}
+            )
+
+            ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4,
+                            color='#E50000', label='fraction closed particles (state C)')
+
+            ax_top.fill_between(time_array / 60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1,
+                                label='flow on')
+
+            ax_top.set_ylabel('state fraction', color='black')
+            ax_top.set_ylim(0, 1.05)
+            ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+            # ax_top.legend(loc='upper left')
+            ax_top.grid(True)
+
+            ax_mid.semilogy(time_array / 60, target_array, label='target', color='black')
+            ax_mid.set_ylabel('[T] (M)')
+            ax_mid.grid(True, axis='x', which='both')
+            ax_mid.set_yscale('log')
+            # ax_mid.set_xlabel('time (minutes)')
+            ax_mid.set_xlim(time_array[0] / 60, time_array[-1] / 60)
+
+            ax_bot.plot(vid_times, num_particles_identified, color = "black", label="number of particles")
+            # ax_bot.set_ylabel('number of particles', color='black', fontsize=10)
+            ax_bot.legend(loc='upper right', fontsize = 10)
+            ax_bot.set_xlabel('time (minutes)')
+            ax_bot.set_xlim(time_array[0] / 60, time_array[-1] / 60)
 
 
 def gen_target(steps: np.ndarray, duration: int, time_step: float):
@@ -3211,3 +3289,292 @@ def truncate_positions(df, vid_num, new_length: int):
 
     return df
 
+
+def plot_particle_state(particles_df, vid_num, image_path, box_pixel_len):
+
+    # image = tifffile.imread(image_path)[0, :, :]  # subset to first 10 for speed
+    #
+    # # Invert, subset first image, and compute image shape
+    # # Invert image
+    # image = ((2 ** 16 - 1) - image)
+    # image = image - np.min(image) + 1
+    #
+    # # Ensure we have a 3-channel image to draw colored boxes
+    # if image.ndim == 2:
+    #     ann = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)   # grayscale -> BGR
+    # else:
+    #     ann = image.copy()
+    img16 = tifffile.imread(image_path)[0].astype(np.uint16)
+
+    # invert and shift
+    img16 = (65535 - img16)
+    img16 = (img16 - img16.min())  # >= 0
+
+    # --- downscale to 8-bit for RGB plotting ---
+    # robust linear scaling 0..max -> 0..255
+    den = int(img16.max()) or 1
+    img8 = cv2.convertScaleAbs(img16, alpha=255.0 / den)  # uint8
+
+    # color canvas to draw boxes (BGR)
+    ann = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+
+    box = int(box_pixel_len)
+
+    # Colors in **BGR** (OpenCV): blue, yellow
+    BLUE   = (255,  0,  0)
+    RED    = (0,    0,  255)
+    YELLOW = (0,    255, 255)
+
+
+    col_part_num = particles_df.columns.get_loc("Particle Number")
+    col_x = particles_df.columns.get_loc(f"({vid_num}) mean x position")
+    col_y = particles_df.columns.get_loc(f"({vid_num}) mean y position")
+    col_state = particles_df.columns.get_loc(f"({vid_num}) state")
+
+    for i, row in enumerate(particles_df.itertuples(index=False, name=None)):
+        particle_number = row[col_part_num]
+        x = np.round(row[col_x])
+        y = np.round(row[col_y])
+
+        val = row[col_state]
+        if pd.isna(val):  # handles pd.NA, np.nan
+            state_color = YELLOW
+        elif bool(val):  # True branch
+            state_color = RED
+        else:  # False branch
+            state_color = BLUE
+
+
+        cv2.rectangle(ann, (int(x - box), int(y - box)), (int(x + box), int(y + box)), state_color, 2)
+        cv2.putText(ann, str(particle_number), (int(x), int(y + 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_color, 1, cv2.LINE_AA)
+
+
+
+
+
+    # Show: convert BGR -> RGB for matplotlib; don't use cmap here
+    plt.figure(figsize=(20, 20))
+    plt.imshow(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+    plt.show()
+
+    def plot_particle_state(particles_df, vid_num, image_path, box_pixel_len):
+
+        # image = tifffile.imread(image_path)[0, :, :]  # subset to first 10 for speed
+        #
+        # # Invert, subset first image, and compute image shape
+        # # Invert image
+        # image = ((2 ** 16 - 1) - image)
+        # image = image - np.min(image) + 1
+        #
+        # # Ensure we have a 3-channel image to draw colored boxes
+        # if image.ndim == 2:
+        #     ann = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)   # grayscale -> BGR
+        # else:
+        #     ann = image.copy()
+        img16 = tifffile.imread(image_path)[0].astype(np.uint16)
+
+        # invert and shift
+        img16 = (65535 - img16)
+        img16 = (img16 - img16.min())  # >= 0
+
+        # --- downscale to 8-bit for RGB plotting ---
+        # robust linear scaling 0..max -> 0..255
+        den = int(img16.max()) or 1
+        img8 = cv2.convertScaleAbs(img16, alpha=255.0 / den)  # uint8
+
+        # color canvas to draw boxes (BGR)
+        ann = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+
+        box = int(box_pixel_len)
+
+        # Colors in **BGR** (OpenCV): blue, yellow
+        BLUE = (255, 0, 0)
+        RED = (0, 0, 255)
+        YELLOW = (0, 255, 255)
+
+        col_part_num = particles_df.columns.get_loc("Particle Number")
+        col_x = particles_df.columns.get_loc(f"({vid_num}) mean x position")
+        col_y = particles_df.columns.get_loc(f"({vid_num}) mean y position")
+        col_state = particles_df.columns.get_loc(f"({vid_num}) state")
+
+        for i, row in enumerate(particles_df.itertuples(index=False, name=None)):
+            particle_number = row[col_part_num]
+            x = np.round(row[col_x])
+            y = np.round(row[col_y])
+
+            val = row[col_state]
+            if pd.isna(val):  # handles pd.NA, np.nan
+                state_color = YELLOW
+            elif bool(val):  # True branch
+                state_color = RED
+            else:  # False branch
+                state_color = BLUE
+
+            cv2.rectangle(ann, (int(x - box), int(y - box)), (int(x + box), int(y + box)), state_color, 2)
+            cv2.putText(ann, str(particle_number), (int(x), int(y + 18)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_color, 1, cv2.LINE_AA)
+
+        # Show: convert BGR -> RGB for matplotlib; don't use cmap here
+        plt.figure(figsize=(20, 20))
+        plt.imshow(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB))
+        plt.axis('off')
+        plt.show()
+
+
+
+def plot_particle_metric_colored_boxes(
+    particles_df,
+    vid_num,
+    image_path,
+    box_pixel_len,
+    vmin=0.0,
+    vmax=0.2,
+    cmap_name="bwr",           # blue→white→red; try "coolwarm" if you prefer
+    nan_color=(128,128,128),   # BGR for NaNs / out-of-bounds rows
+    draw_labels=True
+):
+    # --- load & prep grayscale background (uint8 for matplotlib RGB) ---
+    img16 = tifffile.imread(image_path)[0].astype(np.uint16)
+    img16 = (65535 - img16)
+    img16 = img16 - img16.min()
+    den = int(img16.max()) or 1
+    img8 = cv2.convertScaleAbs(img16, alpha=255.0/den)
+    ann = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+
+    H, W = ann.shape[:2]
+    box = int(box_pixel_len)
+
+    # --- column indices ---
+    col_part_num = particles_df.columns.get_loc("Particle Number")
+    col_x        = particles_df.columns.get_loc(f"({vid_num}) mean x position")
+    col_y        = particles_df.columns.get_loc(f"({vid_num}) mean y position")
+    col_metric   = particles_df.columns.get_loc(f"({vid_num}) stdev x position")
+
+    # --- colormap & normalization (to get RGB in [0,255]) ---
+    norm = mpl_colors.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    cmap = cm.get_cmap(cmap_name)
+
+    def val_to_bgr(v):
+        if pd.isna(v):
+            return nan_color
+        rgba = cmap(norm(float(v)))            # (r,g,b,a) in 0..1
+        r, g, b = [int(255*x) for x in rgba[:3]]
+        return (b, g, r)                      # OpenCV is BGR
+
+    # --- draw boxes ---
+    for row in particles_df.itertuples(index=False, name=None):
+        particle_number = row[col_part_num]
+        x_val, y_val    = row[col_x], row[col_y]
+        m_val           = row[col_metric]
+
+        # skip if coords invalid
+        if not np.isfinite(x_val) or not np.isfinite(y_val):
+            continue
+
+        x = int(np.round(x_val)); y = int(np.round(y_val))
+        x0 = max(0, x - box); y0 = max(0, y - box)
+        x1 = min(W-1, x + box); y1 = min(H-1, y + box)
+
+        color = val_to_bgr(m_val)
+        cv2.rectangle(ann, (x0, y0), (x1, y1), color, 2)
+
+        if draw_labels:
+            cv2.putText(ann, str(int(particle_number)),
+                        (x, min(y + 18, H-1)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+    # --- show with matching colorbar ---
+    plt.figure(figsize=(20, 20))
+    plt.imshow(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+
+    # # add colorbar using the same norm/cmap
+    # sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+    # sm.set_array([])  # required for older matplotlib
+    # cbar = plt.colorbar(sm, fraction=0.046, pad=0.02)
+    # cbar.set_label(f"({vid_num}) stdev x position")
+
+    plt.show()
+
+
+def plot_particle_metric_colored_boxes(
+    particles_df,
+    image_path,
+    vid_num:int = 1,
+    ref_vid_num:int = 0,
+    box_pixel_len: int = 5,
+    metric_str: str = "stdev x position",
+    vmin=0.0,
+    vmax=0.2,
+    cmap_name="bwr",           # blue→white→red; try "coolwarm" if you prefer
+    nan_color=(128,128,128),   # BGR for NaNs / out-of-bounds rows
+    draw_labels=True
+):
+    # --- load & prep grayscale background (uint8 for matplotlib RGB) ---
+    img16 = tifffile.imread(image_path)[0].astype(np.uint16)
+    img16 = (65535 - img16)
+    img16 = img16 - img16.min()
+    den = int(img16.max()) or 1
+    img8 = cv2.convertScaleAbs(img16, alpha=255.0/den)
+    ann = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+
+    H, W = ann.shape[:2]
+    box = int(box_pixel_len)
+
+    # --- column indices ---
+    if ref_vid_num == 0:
+        col_metric_str = f"({vid_num}) " + metric_str
+    else:
+        col_metric_str = f"({ref_vid_num}) to ({vid_num}) " + metric_str
+    col_part_num = particles_df.columns.get_loc("Particle Number")
+    col_x        = particles_df.columns.get_loc(f"({vid_num}) mean x position")
+    col_y        = particles_df.columns.get_loc(f"({vid_num}) mean y position")
+    col_metric   = particles_df.columns.get_loc(col_metric_str)
+
+    # --- colormap & normalization (to get RGB in [0,255]) ---
+    norm = mpl_colors.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    cmap = cm.get_cmap(cmap_name)
+
+    def val_to_bgr(v):
+        if pd.isna(v):
+            return nan_color
+        rgba = cmap(norm(float(v)))            # (r,g,b,a) in 0..1
+        r, g, b = [int(255*x) for x in rgba[:3]]
+        return (b, g, r)                      # OpenCV is BGR
+
+    # --- draw boxes ---
+    for row in particles_df.itertuples(index=False, name=None):
+        particle_number = row[col_part_num]
+        x_val, y_val    = row[col_x], row[col_y]
+        m_val           = row[col_metric]
+
+        # skip if coords invalid
+        if not np.isfinite(x_val) or not np.isfinite(y_val):
+            continue
+
+        x = int(np.round(x_val)); y = int(np.round(y_val))
+        x0 = max(0, x - box); y0 = max(0, y - box)
+        x1 = min(W-1, x + box); y1 = min(H-1, y + box)
+
+        color = val_to_bgr(m_val)
+        cv2.rectangle(ann, (x0, y0), (x1, y1), color, 2)
+
+        if draw_labels:
+            cv2.putText(ann, str(int(particle_number)),
+                        (x, min(y + 18, H-1)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+    # --- show with matching colorbar ---
+    plt.figure(figsize=(20, 20))
+    plt.imshow(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+
+    # # add colorbar using the same norm/cmap
+    # sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+    # sm.set_array([])  # required for older matplotlib
+    # cbar = plt.colorbar(sm, fraction=0.046, pad=0.02)
+    # cbar.set_label(f"({vid_num}) stdev x position")
+
+    plt.show()
