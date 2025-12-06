@@ -2,6 +2,7 @@ import cv2
 from skimage import measure
 import numpy as np
 import tifffile
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from matplotlib import cm, colors as mpl_colors
@@ -59,44 +60,103 @@ def filter_close_particles(particles: List[Any], min_distance: float = 20.0) -> 
     return filtered_particles
 
 
-def fit_2d_gaussian(image):
-    """Fits a 2D Gaussian function to the given image."""
+# def fit_2d_gaussian(image):
+#     """Fits a 2D Gaussian function to the given image."""
+#
+#     def twoD_Gaussian(xy, amplitude, xo, yo, sigma_x, sigma_y, offset):
+#         x, y = xy
+#         g = offset + amplitude * np.exp(-(((x - xo) ** 2) / (2 * sigma_x ** 2) + ((y - yo) ** 2) / (2 * sigma_y ** 2)))
+#         return g.ravel()
+#
+#     # Normalize image for numerical stability
+#     min_val = np.min(image)
+#     max_val = np.max(image)
+#     if max_val > min_val:
+#         image = (image - min_val) / (max_val - min_val)
+#     elif min_val == max_val:
+#         return None, False # fit is bound to fail
+#         # image = np.zeros_like(image)
+#
+#     # Generate x, y indices
+#     x = np.arange(image.shape[1])
+#     y = np.arange(image.shape[0])
+#     x, y = np.meshgrid(x, y)
+#
+#     # Improved initial guess using brightest pixel
+#     x_peak, y_peak = np.unravel_index(np.argmax(image), image.shape)
+#     initial_guess = (np.max(image), x_peak, y_peak, 5, 5, np.min(image))
+#
+#     # Apply bounds to stabilize fitting
+#     try:
+#         params, _ = curve_fit(
+#             twoD_Gaussian, (x, y), image.ravel(),
+#             p0=initial_guess,
+#             bounds=([0, 0, 0, 1, 1, 0], [np.inf, image.shape[1], image.shape[0], 20, 20, np.max(image)])
+#         )
+#
+#         return params, True
+#     except RuntimeError as e:
+#         print(f"Gaussian fit failed: {e}")
+#         return None, False  # Return None, False if fitting fails
 
+
+
+
+def fit_2d_gaussian(image):
+    """Fits a 2D Gaussian to 'image'. Returns (params, True) or (None, False)."""
     def twoD_Gaussian(xy, amplitude, xo, yo, sigma_x, sigma_y, offset):
         x, y = xy
-        g = offset + amplitude * np.exp(-(((x - xo) ** 2) / (2 * sigma_x ** 2) + ((y - yo) ** 2) / (2 * sigma_y ** 2)))
+        g = offset + amplitude * np.exp(
+            -(((x - xo)**2) / (2 * sigma_x**2) + ((y - yo)**2) / (2 * sigma_y**2))
+        )
         return g.ravel()
 
-    # Normalize image for numerical stability
-    min_val = np.min(image)
-    max_val = np.max(image)
-    if max_val > min_val:
-        image = (image - min_val) / (max_val - min_val)
-    elif min_val == max_val:
-        return None, False # fit is bound to fail
-        # image = np.zeros_like(image)
+    # guard against NaNs/Infs
+    if not np.isfinite(image).all():
+        image = np.nan_to_num(image, copy=True)
 
-    # Generate x, y indices
-    x = np.arange(image.shape[1])
-    y = np.arange(image.shape[0])
-    x, y = np.meshgrid(x, y)
+    # Normalize (0..1) for stability
+    imin, imax = float(np.min(image)), float(np.max(image))
+    if imax <= imin:
+        return None, False
+    img = (image - imin) / (imax - imin)
 
-    # Improved initial guess using brightest pixel
-    x_peak, y_peak = np.unravel_index(np.argmax(image), image.shape)
-    initial_guess = (np.max(image), x_peak, y_peak, 5, 5, np.min(image))
+    # Coordinates
+    ny, nx = img.shape  # rows (y), cols (x)
+    x = np.arange(nx)
+    y = np.arange(ny)
+    X, Y = np.meshgrid(x, y)
 
-    # Apply bounds to stabilize fitting
+    # Seed using brightest pixel (remember unravel_index -> (row=y, col=x))
+    y_peak, x_peak = np.unravel_index(np.argmax(img), img.shape)
+
+    # Initial guess (clip inside bounds)
+    amp0   = float(img.max())
+    xo0    = float(np.clip(x_peak, 0, nx-1))
+    yo0    = float(np.clip(y_peak, 0, ny-1))
+    sx0    = 5.0
+    sy0    = 5.0
+    off0   = float(img.min())
+
+    p0 = (amp0, xo0, yo0, sx0, sy0, off0)
+
+    # Bounds (normalized image -> amplitude/offset in [0, 1]; sigmas positive)
+    lower = (0.0,          0.0,        0.0,        1.0,        1.0,        0.0)
+    upper = (1.5,          nx-1+1e-6,  ny-1+1e-6,  20.0,       20.0,       1.0)
+
+    # Ensure p0 is strictly inside bounds
+    p0 = np.minimum(np.maximum(p0, np.array(lower)+1e-9), np.array(upper)-1e-9)
+
     try:
         params, _ = curve_fit(
-            twoD_Gaussian, (x, y), image.ravel(),
-            p0=initial_guess,
-            bounds=([0, 0, 0, 1, 1, 0], [np.inf, image.shape[1], image.shape[0], 20, 20, np.max(image)])
+            twoD_Gaussian, (X, Y), img.ravel(),
+            p0=p0, bounds=(lower, upper), maxfev=20000
         )
-
         return params, True
-    except RuntimeError as e:
+    except Exception as e:
         print(f"Gaussian fit failed: {e}")
-        return None, False  # Return None, False if fitting fails
+        return None, False
+
 
 def fit_radial_gaussian_ring(image):
     """
@@ -390,7 +450,8 @@ def add_mean_position_cols(df, vid_num: int):
 
 def track_video_drift_correction(video_num: int, ref_video_num: int, image_path: str, ref_image_path: str, background_image_path: str,
                 particles_df, scope: str = "nikon", magnification: int = 10, parallelize: bool = False, subtract_background: bool = False,
-                offset_y: int = 0, error_threshold: float = 0.25):
+                offset_y: int = 0, error_threshold: float = 0.25, x_drift_manual: float = 0.0, y_drift_manual: float = 0.0):
+
     start = time.time()
 
     ##--Specify magnification and pixel size --##
@@ -457,11 +518,14 @@ def track_video_drift_correction(video_num: int, ref_video_num: int, image_path:
     add_mean_position_cols(df=fiducial_particles_df, vid_num=ref_video_num)
 
     # Track video for fiducials
+
+    fiducial_particles_df["Localized X Position"] += x_drift_manual
+    fiducial_particles_df["Localized Y Position"] += y_drift_manual
+
     track_video(video_num=video_num, image_path=image_path, background_image_path=background_image_path,
                 particles_df=fiducial_particles_df, scope=scope, magnification=magnification, parallelize=parallelize,
                 subtract_background=subtract_background)
     add_mean_position_cols(df=fiducial_particles_df, vid_num=video_num)
-
 
     # Compute rigid body transformation A to apply to Localized X Position and Localized Y Position to re-center crops
     # extract mean positons of all fiducials in reference video
@@ -469,6 +533,8 @@ def track_video_drift_correction(video_num: int, ref_video_num: int, image_path:
 
     # extract the mean positions of all fiducial in the video
     P2 = extract_mean_fiducial_positions(fiducial_particles_df, vid_num=video_num)
+
+
 
     assert P1.shape == P2.shape
 
@@ -713,6 +779,7 @@ def add_video_average_corrected_mean_position_cols(particles_df, image_paths: Li
             raise ValueError(f"Not enough valid fiducials after dropping nonfinite data: only {P1.shape[1]} left.")
 
         A = rigid_transform_least_squares(P1, P2)
+
 
         if rotate:
             P3_corrected = apply_rigid_transform(A, P3)
@@ -1704,6 +1771,94 @@ def plot_mean_position_shift_histograms(df, correction: str, ref_vid_num: int = 
         print("correction type improperly speficied. Must be 'va' or ''. ")
 
 
+def plot_mean_y_position_shift_histogram(df, correction: str = "va", ref_vid_num: int = 1, vid_num: int = 2, bin_range = (-1, 1), bins: int = 100, figsize=(4, 4),density: bool = False, title: bool = True,
+                                         color_by_state: bool = False, plot_nm: bool = False, nm_per_pixel: float = 730):
+    """
+    Plot histogram of mean Y position shift for PARTICLES ONLY (Particle Number > 0).
+    If correction == "va", uses the '{correction} corrected' column; if "", uses raw.
+    """
+
+    style_inter = {
+        "font.family": "Arial",
+        "font.size": 14,
+        "axes.labelsize": 24,
+        "axes.titlesize": 24,
+        "legend.fontsize": 18,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+    }
+
+    # choose column
+    base_col = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
+    if correction == "va":
+        col = f"({ref_vid_num}) to ({vid_num}) {correction} corrected mean y position shift"
+    elif correction == "":
+        col = base_col
+    else:
+        raise ValueError("correction must be 'va' or '' ")
+
+    scaling_factor = nm_per_pixel if plot_nm else 1.0
+
+    with plt.rc_context(style_inter):
+        fig, ax = plt.subplots(figsize=figsize)
+
+        if color_by_state:
+            data_unbound = (df.loc[(df["Particle Number"] > 0) & (df[f"({vid_num}) state"] == False), col].dropna() * scaling_factor)
+            data_bound = (df.loc[(df["Particle Number"] > 0) & (df[f"({vid_num}) state"] == True), col].dropna()  * scaling_factor)
+            data_undetermined = (df.loc[(df["Particle Number"] > 0) & (df[f"({vid_num}) state"].isna()), col].dropna() * scaling_factor)
+
+            data = [data_unbound, data_bound, data_undetermined]
+            colors = ["blue", "red", "yellow"]
+            bin_edges = np.linspace(scaling_factor*bin_range[0], scaling_factor*bin_range[1], bins + 1)
+
+            for i, d in enumerate(data, start=0):
+                ax.hist(
+                    d,
+                    bins=bins,
+                    range=(scaling_factor * bin_range[0], scaling_factor * bin_range[1]),
+                    density=density,
+                    edgecolor="black",
+                    alpha=0.6,
+                    color=colors[i],
+                )
+
+
+
+        else:
+            # particles only and drop NaNs
+            data = (df.loc[df["Particle Number"] > 0, col].dropna() * scaling_factor)
+
+
+
+
+            # plot
+
+            ax.hist(
+                data,
+                bins=bins,
+                range=(scaling_factor*bin_range[0], scaling_factor*bin_range[1]),
+                density=density,
+                edgecolor="black",
+                alpha=0.6,
+                color="gray",
+            )
+
+        ax.set_xlabel("y shift (nm)" if plot_nm else "y shift (pixels)")
+        ax.set_ylabel("particle count" if not density else "density")
+
+        if title:
+            ax.set_title(f"Y position shift between ({ref_vid_num}) and ({vid_num})"
+                         + (" (va-corrected)" if correction == "va" else " (raw)"))
+        ax.grid(True, alpha=0.25)
+
+        plt.tight_layout()
+        plt.show()
+
+    return
+
+
+
+
 def build_rigid_transform(theta, tx, ty):
     """
     Build a 2D rigid body transformation matrix (rotation + translation)
@@ -2218,7 +2373,7 @@ def mask_on_mean_position_shift(particles_df, ref_vid_num: int = 1, vid_num: int
 
     return mask
 
-def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baseline: float = 0.02, delta_bound_peak: float = -0.25, n_sigma: float = 3, stdev_y_window = (0.0, 0.2), stdev_x_window = (0.0, 0.2), unbound_peak_window = (-0.15, 0.15), correction: str = "va"):
+def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baseline: float = 0.02, use_fitted_sigma: bool = False, delta_bound_peak: float = -0.25, n_sigma: float = 3, stdev_y_window = (0.0, 0.2), stdev_x_window = (0.0, 0.2), unbound_peak_window = (-0.15, 0.15), correction: str = "va"):
     # (1)
     NS_particle_mask = mask_on_NS_particles(particles_df=particles_df)
 
@@ -2228,6 +2383,7 @@ def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baselin
     #                                 bound_peak_y_mean_shift=delta_bound_peak, sigma_guess=sigma_baseline))
     if vid_num == 1:
         mu_unbound = 0.00
+        sigma_unbound = sigma_baseline
     else:
         # find right bin range for fitting
         if correction == "va":
@@ -2240,8 +2396,11 @@ def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baselin
         windowed_data = data[data_mask]
         windowed_mean = np.mean(windowed_data)
         unbound_window_width = unbound_peak_window[1] - unbound_peak_window[0]
-        _, mu_unbound, _ = fit_single_gaussian_y_shift(df=particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num, bins=100, plot=False,
+        _, mu_unbound, sigma_unbound = fit_single_gaussian_y_shift(df=particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num, bins=100, plot=False,
                                     bin_range=(windowed_mean-unbound_window_width/2, windowed_mean+unbound_window_width/2), sigma_guess = 0.02, correction=correction)
+
+    if use_fitted_sigma:
+        sigma_baseline = sigma_unbound
 
     unbound_position_shift_mask = mask_on_mean_position_shift(particles_df=particles_df, vid_num=vid_num,ref_vid_num=ref_vid_num,
                                     mean=mu_unbound, sigma=sigma_baseline, n_sigma=n_sigma, correction=correction)
@@ -2260,9 +2419,78 @@ def digitize(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baselin
     particles_df.loc[bound_mask, f"({vid_num}) state"] = True
     particles_df.loc[unbound_mask, f"({vid_num}) state"] = False
 
+    particles_df[f"({vid_num}) failed stdev x mask?"] = pd.Series([pd.NA] * len(particles_df), dtype='boolean')
+    particles_df.loc[stdev_x_mask, f"({vid_num}) failed stdev x mask?"] = False
+    particles_df.loc[~stdev_x_mask, f"({vid_num}) failed stdev x mask?"] = True
+
+    particles_df[f"({vid_num}) failed stdev y mask?"] = pd.Series([pd.NA] * len(particles_df), dtype='boolean')
+    particles_df.loc[stdev_y_mask, f"({vid_num}) failed stdev y mask?"] = False
+    particles_df.loc[~stdev_y_mask, f"({vid_num}) failed stdev y mask?"] = True
+
+    particles_df[f"({vid_num}) failed y position shift mask?"] = pd.Series([pd.NA] * len(particles_df), dtype='boolean')
+    failed_y_shift_mask = (~unbound_position_shift_mask) & (~bound_position_shift_mask)
+    particles_df.loc[(failed_y_shift_mask), f"({vid_num}) failed y position shift mask?"] = True
+    particles_df.loc[(~failed_y_shift_mask), f"({vid_num}) failed y position shift mask?"] = False
+
+
+
+
     add_num_bound_instances(particles_df)
 
     return
+
+def digitize_on_double_gaussian_fit(particles_df, vid_num: int = 2, ref_vid_num: int = 1, sigma_baseline: float = 0.02, unbound_mu_guess: float = 0.0, delta_bound_peak_guess: float = -0.25, n_sigma: float = 3, stdev_y_window = (0.0, 0.2), stdev_x_window = (0.0, 0.2), correction: str = "va", plot: bool = False):
+    # (1)
+    NS_particle_mask = mask_on_NS_particles(particles_df=particles_df)
+
+    # (2)
+
+    if vid_num == 1:
+        mu_unbound = 0.00
+        mu_bound = mu_unbound + delta_bound_peak_guess
+        sigma_unbound = sigma_baseline
+        sigma_bound = sigma_baseline
+    else:
+        # find right bin range for fitting
+        if correction == "va":
+            column = f"({ref_vid_num}) to ({vid_num}) va corrected mean y position shift"
+        elif correction == "":
+            column = f"({ref_vid_num}) to ({vid_num}) mean y position shift"
+
+        _, mu_unbound, sigma_unbound, _, mu_bound, sigma_bound = (
+            fit_double_gaussian_y_shift(df=particles_df, vid_num=vid_num,
+                                        ref_vid_num=ref_vid_num,
+                                        bins=500,
+                                        plot=plot,
+                                        bin_range=(-1, 1),
+                                        bound_peak_y_mean_shift=delta_bound_peak_guess,
+                                        sigma_guess=sigma_baseline,
+                                        unbound_peak_location_guess=unbound_mu_guess,
+                                        correction=correction
+                                        ))
+
+
+    unbound_position_shift_mask = mask_on_mean_position_shift(particles_df=particles_df, vid_num=vid_num,ref_vid_num=ref_vid_num,
+                                    mean=mu_unbound, sigma=sigma_unbound, n_sigma=n_sigma, correction=correction)
+    bound_position_shift_mask = mask_on_mean_position_shift(particles_df=particles_df, vid_num=vid_num, ref_vid_num=ref_vid_num,
+                                    mean=mu_bound, sigma=sigma_bound, n_sigma=n_sigma, correction=correction)
+    # (3)
+    stdev_x_mask = mask_on_stdev_x_manual(particles_df=particles_df, vid_num=vid_num, window=stdev_x_window)
+
+    stdev_y_mask = mask_on_stdev_y_manual(particles_df=particles_df, vid_num=vid_num, window=stdev_y_window)
+
+    unbound_mask = NS_particle_mask & unbound_position_shift_mask & stdev_y_mask & stdev_x_mask
+    bound_mask = NS_particle_mask & bound_position_shift_mask & stdev_y_mask & stdev_x_mask
+
+    particles_df[f"({vid_num}) state"] = pd.Series([pd.NA] * len(particles_df), dtype='boolean')
+    particles_df.loc[bound_mask, f"({vid_num}) state"] = True
+    particles_df.loc[unbound_mask, f"({vid_num}) state"] = False
+
+    add_num_bound_instances(particles_df)
+
+    return
+
+
 
 def digitize_on_baseline_shift_manual(particles_df, vid_num: int = 2, ref_vid_num: int = 1, unbound_window: tuple = (-0.0, 0.0), bound_window: tuple = (0.0, 0.0), correction: str = "va"):
     state_col = f"({vid_num}) state"
@@ -2299,7 +2527,7 @@ def add_num_bound_instances(particles_df, ref_vid_num=1):
                     particles_df[f"({ref_vid_num}) to ({vid_num-1}) total bound instances"])
 
 
-def create_aggregate_digitized_df(particles_df):
+def create_aggregate_digitized_df(particles_df, nonbinder_correction: bool = False, nonbinder_fraction: float = 0.0):
     unbound_list = []
     bound_list = []
     undetermined_list = []
@@ -2345,55 +2573,117 @@ def create_aggregate_digitized_df(particles_df):
     ci_identified_low, ci_identified_high = zip(*confidence_intervals_identified)
     ci_total_low, ci_total_high = zip(*confidence_intervals_total)
 
-    # Stack columns and create DataFrame
-    aggregate_df = pd.DataFrame(np.column_stack((vid_nums, total_list, identified_list,
-                                                 undetermined_list, undetermined_list/total_list,
-                                                 bound_list,
-                                                 bound_list/identified_list, ci_identified_low, ci_identified_high,
-                                                 bound_list/total_list, ci_total_low, ci_total_high,
-                                                 unbound_list, unbound_list/identified_list, unbound_list/total_list,
-                                                 bound_instances_distributions)),
-                                columns=[
-        "video number", "total number particles", "number identified particles",
-        "number undetermined particles", "fraction total unidentified particles",
-        "number particles bound",
-        "fraction identified particles bound", "95% CI lower (identified)", "95% CI upper (identified)",
-        "fraction total particles bound", "95% CI lower (total)", "95% CI upper (total)",
-        "number particles unbound", "fraction identified particles unbound", "fraction total particles unbound",
-        "bound instances distribution"
-        ])
+    if nonbinder_correction:
+        identified_list_nonbinder_corrected = identified_list * (1.0-nonbinder_fraction)
 
-    # Cast specific columns to integers
-    int_cols = [
-        "video number", "total number particles", "number identified particles",
-        "number undetermined particles", "number particles bound", "number particles unbound"
-    ]
-    aggregate_df[int_cols] = aggregate_df[int_cols].astype(int)
+        # Stack columns and create DataFrame
+        aggregate_df = pd.DataFrame(np.column_stack((vid_nums, total_list, identified_list,
+                                                     undetermined_list, undetermined_list / total_list,
+                                                     bound_list,
+                                                     bound_list / identified_list, ci_identified_low,
+                                                     ci_identified_high,
+                                                     bound_list / total_list, ci_total_low, ci_total_high,
+                                                     unbound_list, unbound_list / identified_list,
+                                                     unbound_list / total_list,
+                                                     bound_instances_distributions,
+                                                     identified_list_nonbinder_corrected,
+                                                     bound_list / identified_list_nonbinder_corrected)),
+                                    columns=[
+                                        "video number", "total number particles", "number identified particles",
+                                        "number undetermined particles", "fraction total unidentified particles",
+                                        "number particles bound",
+                                        "fraction identified particles bound", "95% CI lower (identified)",
+                                        "95% CI upper (identified)",
+                                        "fraction total particles bound", "95% CI lower (total)",
+                                        "95% CI upper (total)",
+                                        "number particles unbound", "fraction identified particles unbound",
+                                        "fraction total particles unbound",
+                                        "bound instances distribution",
+                                        "number identified particles nonbinder corrected",
+                                        "fraction identified particles bound nonbinder corrected"
+                                    ])
+
+        # Cast specific columns to integers
+        int_cols = [
+            "video number", "total number particles", "number identified particles",
+            "number undetermined particles", "number particles bound", "number particles unbound",
+            "number identified particles nonbinder corrected"
+        ]
+        aggregate_df[int_cols] = aggregate_df[int_cols].astype(int)
+
+    else:
+        # Stack columns and create DataFrame
+        aggregate_df = pd.DataFrame(np.column_stack((vid_nums, total_list, identified_list,
+                                                     undetermined_list, undetermined_list/total_list,
+                                                     bound_list,
+                                                     bound_list/identified_list, ci_identified_low, ci_identified_high,
+                                                     bound_list/total_list, ci_total_low, ci_total_high,
+                                                     unbound_list, unbound_list/identified_list, unbound_list/total_list,
+                                                     bound_instances_distributions)),
+                                    columns=[
+            "video number", "total number particles", "number identified particles",
+            "number undetermined particles", "fraction total unidentified particles",
+            "number particles bound",
+            "fraction identified particles bound", "95% CI lower (identified)", "95% CI upper (identified)",
+            "fraction total particles bound", "95% CI lower (total)", "95% CI upper (total)",
+            "number particles unbound", "fraction identified particles unbound", "fraction total particles unbound",
+            "bound instances distribution"
+            ])
+
+        # Cast specific columns to integers
+        int_cols = [
+            "video number", "total number particles", "number identified particles",
+            "number undetermined particles", "number particles bound", "number particles unbound"
+        ]
+        aggregate_df[int_cols] = aggregate_df[int_cols].astype(int)
 
     return aggregate_df
 
 
-def subset_aggregate_digitized_df(particles_df, aggregate_df, subsets: Tuple[List[int], List[int]], vid_list: List[int]):
+def subset_aggregate_digitized_df(particles_df, aggregate_df, subsets: Tuple[List[int], List[int]], vid_list: List[int], nonbinder_correction: bool = False, nonbinder_fraction: float = 0.0):
     open_subset_vids = subsets[0]
     closed_subset_vids = subsets[1]
 
-    subset_cols = [
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) total number particles",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number identified particles",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number undetermined particles",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total undetermined particles",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number particles bound",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles bound",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI lower (identified)",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI upper (identified)",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total particles bound",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI lower (total)",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI upper (total)",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number particles unbound",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles unbound",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total particles unbound",
-        f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) bound instances distribution"
-    ]
+    if nonbinder_correction:
+        subset_cols = [
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) total number particles",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number identified particles",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number undetermined particles",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total undetermined particles",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number particles bound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles bound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI lower (identified)",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI upper (identified)",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total particles bound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI lower (total)",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI upper (total)",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number particles unbound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles unbound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total particles unbound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) bound instances distribution",
+
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number identified particles nonbinder corrected",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles bound nonbinder corrected",
+        ]
+
+    else:
+        subset_cols = [
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) total number particles",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number identified particles",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number undetermined particles",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total undetermined particles",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number particles bound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles bound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI lower (identified)",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI upper (identified)",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total particles bound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI lower (total)",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) 95% CI upper (total)",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) number particles unbound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction identified particles unbound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) fraction total particles unbound",
+            f"subset: (open {open_subset_vids}) (closed {closed_subset_vids}) bound instances distribution"
+        ]
 
     # pre-allocate cols with proper types
     for col in subset_cols:
@@ -2433,6 +2723,9 @@ def subset_aggregate_digitized_df(particles_df, aggregate_df, subsets: Tuple[Lis
         total_count = unbound_count + bound_count + undetermined_count
         identified_count = unbound_count + bound_count
 
+        if nonbinder_correction:
+            identified_count_nonbinder_corrected = int(identified_count * (1.0 - nonbinder_fraction))
+
         ci_identified_low, ci_identified_high = calculate_confidence_intervals(identified_count, bound_count)
         ci_total_low, ci_total_high = calculate_confidence_intervals(total_count, bound_count)
 
@@ -2464,6 +2757,11 @@ def subset_aggregate_digitized_df(particles_df, aggregate_df, subsets: Tuple[Lis
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[12]] = unbound_count / identified_count
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[13]] = unbound_count / total_count
         aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[14]] = [bound_instances_distribution]
+
+        if nonbinder_correction:
+            aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[15]] = identified_count_nonbinder_corrected
+            aggregate_df.loc[aggregate_df["video number"] == vid_num, subset_cols[16]] = bound_count / identified_count_nonbinder_corrected
+
 
     aggregate_df = aggregate_df.copy()
 
@@ -2635,12 +2933,15 @@ def closed_subset_aggregate_digitized_df(particles_df, aggregate_df, ref_vid_num
 
 
 def calculate_confidence_intervals(n: int, k: int):
-    """Calculates 95% CI for normal approximation of binomial distribution"""
+    """Calculates 95% CI for normal approximation of binomial distribution, using Wilson score interval"""
     if n == 0:
         return np.nan, np.nan
     p_hat = k/n
-    standard_error = np.sqrt((p_hat*(1-p_hat))/n)
-    confidence_interval = (p_hat - 1.96*standard_error, p_hat + 1.96*standard_error)
+    z = 1.96
+    den = 1 + (z**2)/n
+    center = (p_hat + (z**2/(2*n)))/den
+    halfwidth = (z/den) * np.sqrt(((p_hat*(1-p_hat))/n) + z**2 / (4*n))
+    confidence_interval = (center-halfwidth, center+halfwidth)
 
     return confidence_interval
 
@@ -2710,7 +3011,7 @@ def plot_binding_instances_histogram(dict):
     return
 
 
-def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, flow, duration, particle_selection: str = "identified"):
+def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, flow, duration, particle_selection: str = "identified", fig_size: Tuple = (30,10), plot_CI: bool = False, plot_nonbindinder_correction: bool = False, plot_range: tuple = (0.0, 1.01)):
 
 
     style_inter = {
@@ -2723,13 +3024,13 @@ def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, 
         "ytick.labelsize": 18,
     }
 
-    plt.figure(figsize=(12, 4))
+    plt.figure(figsize=fig_size)
 
     time_step = 1  # s
 
     time_array = np.arange(0,duration*60, time_step)
-    target_array = gen_target(steps=target, duration=duration, time_step=time_step)
-    flow_array = gen_mode(steps=flow, duration=duration, time_step=time_step)
+    target_array = gen_target_or_flow(steps=target, duration=duration, time_step=time_step)
+    flow_array = gen_target_or_flow(steps=flow, duration=duration, time_step=time_step)
 
     frac_bound = []
     frac_unbound = []
@@ -2740,17 +3041,36 @@ def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, 
 
     for vid_num in vid_nums:
         if particle_selection == "identified":
-            frac_bound.append(
-                aggregate_df[aggregate_df["video number"] == vid_num]["fraction identified particles bound"].values[0])
-            frac_unbound.append(
-                aggregate_df[aggregate_df["video number"] == vid_num]["fraction identified particles unbound"].values[0])
-            frac_unidentified.append(0.00)
-            frac_bound_CI_lower.append(
-                aggregate_df[aggregate_df["video number"] == vid_num]["95% CI lower (identified)"].values[0])
-            frac_bound_CI_upper.append(
-                aggregate_df[aggregate_df["video number"] == vid_num]["95% CI upper (identified)"].values[0])
-            num_particles_identified.append(
-                aggregate_df[aggregate_df["video number"] == vid_num]["number identified particles"].values[0])
+            if plot_nonbindinder_correction:
+                confidence_interval = calculate_confidence_intervals(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["number identified particles nonbinder corrected"].values[0],
+                    aggregate_df[aggregate_df["video number"] == vid_num]["number particles bound"].values[0])
+
+                frac_bound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["fraction identified particles bound nonbinder corrected"].values[
+                        0])
+                frac_unbound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][
+                        "fraction identified particles unbound"].values[0])
+                frac_unidentified.append(0.00)
+                frac_bound_CI_lower.append(confidence_interval[0]) # these are not correct as is- need to fix up the pipeline
+                frac_bound_CI_upper.append(confidence_interval[1]) # these are not correct as is- need to fix up the pipeline
+                num_particles_identified.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["number identified particles nonbinder corrected"].values[0])
+
+
+            else:
+                frac_bound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["fraction identified particles bound"].values[0])
+                frac_unbound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["fraction identified particles unbound"].values[0])
+                frac_unidentified.append(0.00)
+                frac_bound_CI_lower.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["95% CI lower (identified)"].values[0])
+                frac_bound_CI_upper.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["95% CI upper (identified)"].values[0])
+                num_particles_identified.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["number identified particles"].values[0])
 
 
         elif particle_selection == "total":
@@ -2771,76 +3091,110 @@ def plot_sensor_response(aggregate_df, vid_nums: List, vid_times: List, target, 
         else:
             print("particle selection not properly specified!")
             return
-    bound_error_lower = list(np.asarray(frac_bound)-np.asarray(frac_bound_CI_lower))
-    bound_error_higher = list(np.asarray(frac_bound_CI_upper)-np.asarray(frac_bound))
+    bound_error_lower = list(np.asarray(frac_bound_CI_lower))
+    bound_error_higher = list(np.asarray(frac_bound_CI_upper))
 
 
     with plt.rc_context(style_inter):
         if particle_selection == "total":
-            fig, (ax_top, ax_bot) = plt.subplots(
-                2, 1, figsize=(12, 6),
+            fig, (ax_state, ax_target) = plt.subplots(
+                2, 1, figsize=fig_size,
                 sharex=True,
-                gridspec_kw={"height_ratios": [3, 1], "hspace": 0.25}
+                gridspec_kw={"height_ratios": [6, 2], "hspace": 0.25}
             )
 
+            ax_state.plot(vid_times, frac_bound, marker='o', color='#E50000', label='fraction closed particles (state C)')
+            if plot_CI:
+                ax_state.fill_between(vid_times, bound_error_lower, bound_error_higher, color='#E50000', alpha = 0.2, edgecolor="none")
 
-            ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4, color='#E50000', label='fraction closed particles (state C)')
+            for flow_event in flow:
+                time_mask = (time_array/60>flow_event[0]) & (time_array/60<flow_event[1])
+                speed = flow_event[2]
+                if speed == 50:
+                    alpha = 0.1
+                elif speed == 100:
+                    alpha = 0.2
+                elif speed == 300:
+                    alpha = 0.3
+                elif speed == 500:
+                    alpha = 0.5
+                else:
+                    alpha = 0.0
+
+                ax_state.fill_between(time_array/60, 0.0, 1.05, where=time_mask, color='blue', alpha=alpha)
 
 
+            ax_state.set_ylabel('state fraction', color='black')
+            ax_state.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+            ax_state.set_ylim(plot_range[0], plot_range[1])
 
-            ax_top.fill_between(time_array/60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1, label='flow on')
-
-            ax_top.set_ylabel('state fraction', color='black')
-            ax_top.set_ylim(0, 1.05)
-            ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-            # ax_top.legend(loc='upper left')
-            ax_top.grid(True)
+            # ax_state.legend(loc='upper left')
+            ax_state.grid(True)
 
 
-            ax_bot.semilogy(time_array/60, target_array, label='target', color='black')
-            ax_bot.set_ylabel('[T] (M)')
-            ax_bot.grid(True, axis='x', which='both')
-            ax_bot.set_yscale('log')
-            ax_bot.set_xlabel('time (minutes)')
-            ax_bot.set_xlim(time_array[0]/60, time_array[-1]/60)
+            ax_target.semilogy(time_array/60, target_array, label='target', color='black')
+            ax_target.set_ylabel('[T] (M)')
+            ax_target.grid(True, axis='x', which='both')
+            ax_target.set_yscale('log')
+
+
 
             plt.show()
         if particle_selection == "identified":
-            fig, (ax_top, ax_mid, ax_bot) = plt.subplots(
-                3, 1, figsize=(14, 6),
+            fig, (ax_state, ax_target, ax_particles) = plt.subplots(
+                3, 1, figsize=fig_size,
                 sharex=True,
                 gridspec_kw={"height_ratios": [6, 2, 1], "hspace": 0.15}
             )
 
-            ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4,
-                            color='#E50000', label='fraction closed particles (state C)')
+            ax_state.plot(vid_times, frac_bound, marker='o', color='#E50000',
+                          label='fraction closed particles (state C)')
+            if plot_CI:
+                ax_state.fill_between(vid_times, bound_error_lower, bound_error_higher, color='#E50000', alpha=0.2,
+                                      edgecolor="none")
 
-            ax_top.fill_between(time_array / 60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1,
-                                label='flow on')
+            for flow_event in flow:
+                time_mask = (time_array/60>flow_event[0]) & (time_array/60<flow_event[1])
+                speed = flow_event[2]
+                if speed == 50:
+                    alpha = 0.1
+                elif speed == 100:
+                    alpha = 0.2
+                elif speed == 300:
+                    alpha = 0.3
+                elif speed == 500:
+                    alpha = 0.5
+                else:
+                    alpha = 0.0
 
-            ax_top.set_ylabel('state fraction', color='black')
-            ax_top.set_ylim(0, 1.05)
-            ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-            # ax_top.legend(loc='upper left')
-            ax_top.grid(True)
-
-            ax_mid.semilogy(time_array / 60, target_array, label='target', color='black')
-            ax_mid.set_ylabel('[T] (M)')
-            ax_mid.grid(True, axis='x', which='both')
-            ax_mid.set_yscale('log')
-            # ax_mid.set_xlabel('time (minutes)')
-            ax_mid.set_xlim(time_array[0] / 60, time_array[-1] / 60)
-
-            ax_bot.plot(vid_times, num_particles_identified, color = "black", label="number of particles")
-            # ax_bot.set_ylabel('number of particles', color='black', fontsize=10)
-            ax_bot.legend(loc='upper right', fontsize = 10)
-            ax_bot.set_xlabel('time (minutes)')
-            ax_bot.set_xlim(time_array[0] / 60, time_array[-1] / 60)
+                ax_state.fill_between(time_array/60, 0.0, plot_range[1], where=time_mask, color='blue', alpha=alpha)
 
 
+            ax_state.set_ylabel('state fraction', color='black')
+            ax_state.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+            ax_state.set_ylim(plot_range[0], plot_range[1])
+
+            # ax_state.legend(loc='upper left')
+            ax_state.grid(True)
+
+            ax_target.semilogy(time_array / 60, target_array, label='target', color='black')
+            ax_target.set_ylabel('[T] (M)')
+            ax_target.grid(True, axis='x', which='both')
+            ax_target.set_yscale('log')
+            # ax_target.set_xlabel('time (minutes)')
+            ax_target.set_xlim(time_array[0] / 60, time_array[-1] / 60)
+
+            ax_particles.plot(vid_times, num_particles_identified, color = "black", label="number of particles")
+            # ax_particles.set_ylabel('number of particles', color='black', fontsize=10)
+            ax_particles.legend(loc='upper right', fontsize = 10)
+            ax_particles.set_xlabel('time (minutes)')
+            ax_particles.set_xlim(time_array[0] / 60, time_array[-1] / 60)
 
 
-def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, target, flow, duration, subsets_strings: List[str], subsets_videos: List[List[int]], particle_selection: str = "identified"):
+
+
+def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, target, flow, duration, subsets_strings: List[str], subsets_videos: List[List[int]], fig_size: Tuple = (30,10), plot_CI: bool = False,
+                                 plot_nonbindinder_correction: bool = False, plot_range: tuple = (0.0, 1.01)):
 
     style_inter = {
         "font.family": "Arial",
@@ -2861,13 +3215,13 @@ def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, 
         print("vid_nums and subsets_videos do not perfectly overlap!")
         return
 
-    plt.figure(figsize=(12, 4))
+    plt.figure(figsize=fig_size)
 
     time_step = 1  # s
 
     time_array = np.arange(0,duration*60, time_step)
-    target_array = gen_target(steps=target, duration=duration, time_step=time_step)
-    flow_array = gen_mode(steps=flow, duration=duration, time_step=time_step)
+    target_array = gen_target_or_flow(steps=target, duration=duration, time_step=time_step)
+    flow_array = gen_target_or_flow(steps=flow, duration=duration, time_step=time_step)
 
     frac_bound = []
     frac_unbound = []
@@ -2875,12 +3229,38 @@ def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, 
     frac_bound_CI_lower = []
     frac_bound_CI_upper = []
     num_particles_identified = []
+    total_num_particles_identified = []
 
 
     for idx, sub_string in enumerate(subsets_strings,start=0):
         for vid_num in subsets_videos[idx]:
 
-            if particle_selection == "identified":
+            if plot_nonbindinder_correction:
+                confidence_interval = calculate_confidence_intervals(
+                    aggregate_df[aggregate_df["video number"] == vid_num][
+                        sub_string + "number identified particles nonbinder corrected"].values[0],
+                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string + "number particles bound"].values[0])
+
+                frac_bound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][
+                        sub_string + "fraction identified particles bound nonbinder corrected"].values[
+                        0])
+                frac_unbound.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][
+                        sub_string + "fraction identified particles unbound"].values[0])
+                frac_unidentified.append(0.00)
+                frac_bound_CI_lower.append(
+                    confidence_interval[0])  # these are not correct as is- need to fix up the pipeline
+                frac_bound_CI_upper.append(
+                    confidence_interval[1])  # these are not correct as is- need to fix up the pipeline
+                num_particles_identified.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num][
+                        sub_string+"number identified particles nonbinder corrected"].values[0])
+                total_num_particles_identified.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["number identified particles nonbinder corrected"].values[0])
+
+
+            else:
                 frac_bound.append(
                     aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction identified particles bound"].values[0])
                 frac_unbound.append(
@@ -2892,95 +3272,72 @@ def plot_sensor_response_subsets(aggregate_df, vid_nums: List, vid_times: List, 
                     aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI upper (identified)"].values[0])
                 num_particles_identified.append(
                     aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"number identified particles"].values[0])
+                total_num_particles_identified.append(
+                    aggregate_df[aggregate_df["video number"] == vid_num]["number identified particles"].values[0])
 
-            elif particle_selection == "total":
-                frac_bound.append(
-                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction total particles bound"].values[0])
-                frac_unbound.append(
-                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction total particles unbound"].values[
-                        0])
-                frac_unidentified.append(
-                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"fraction total unidentified particles"].values[
-                        0]
-                )
-                frac_bound_CI_lower.append(
-                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI lower (total)"].values[0])
-                frac_bound_CI_upper.append(
-                    aggregate_df[aggregate_df["video number"] == vid_num][sub_string+"95% CI upper (total)"].values[0])
-
-            else:
-                print("particle selection not properly specified!")
-                return
-
-    bound_error_lower = list(np.asarray(frac_bound)-np.asarray(frac_bound_CI_lower))
-    bound_error_higher = list(np.asarray(frac_bound_CI_upper)-np.asarray(frac_bound))
+    bound_error_lower = list(np.asarray(frac_bound_CI_lower))
+    bound_error_higher = list(np.asarray(frac_bound_CI_upper))
 
 
 
     with plt.rc_context(style_inter):
-        if particle_selection == "total":
-            fig, (ax_top, ax_bot) = plt.subplots(
-                2, 1, figsize=(12, 6),
-                sharex=True,
-                gridspec_kw={"height_ratios": [3, 1], "hspace": 0.25}
-            )
+
+        fig, (ax_state, ax_target, ax_particles) = plt.subplots(
+            3, 1, figsize=fig_size,
+            sharex=True,
+            gridspec_kw={"height_ratios": [6, 2, 2], "hspace": 0.15}
+        )
+        for subset in subsets_videos:
+
+            ax_state.plot(vid_times, frac_bound, marker='o', color='#E50000',
+                          label='fraction closed particles (state C)')
+            if plot_CI:
+                ax_state.fill_between(vid_times, bound_error_lower, bound_error_higher, color='#E50000', alpha=0.2,
+                                      edgecolor="none")
+
+        for flow_event in flow:
+            time_mask = (time_array / 60 > flow_event[0]) & (time_array / 60 < flow_event[1])
+            speed = flow_event[2]
+            if speed == 50:
+                alpha = 0.1
+            elif speed == 100:
+                alpha = 0.2
+            elif speed == 300:
+                alpha = 0.3
+            elif speed == 500:
+                alpha = 0.5
+            else:
+                alpha = 0.0
+
+            ax_state.fill_between(time_array / 60, 0.0, 1.05, where=time_mask, color='blue', alpha=alpha)
+
+        ax_state.set_ylabel('state fraction', color='black')
+        ax_state.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+        ax_state.set_ylim(plot_range[0], plot_range[1])
+
+        # ax_state.legend(loc='upper left')
+        ax_state.grid(True)
+
+        ax_target.semilogy(time_array / 60, target_array, label='target', color='black')
+        ax_target.set_ylabel('[T] (M)')
+        ax_target.grid(True, axis='x', which='both')
+        ax_target.set_yscale('log')
+        # ax_target.set_xlabel('time (minutes)')
+        ax_target.set_xlim(time_array[0] / 60, time_array[-1] / 60)
+
+        ax_particles.plot(vid_times, total_num_particles_identified, color = "grey", label="total identified particles")
+        ax_particles.plot(vid_times, num_particles_identified, color = "black", label="subset identified particles")
+
+        # ax_particles.set_ylabel('number of particles', color='black', fontsize=10)
+        ax_particles.legend(loc='upper right', fontsize = 12)
+        ax_particles.set_xlabel('time (minutes)')
+        ax_particles.set_xlim(time_array[0] / 60, time_array[-1] / 60)
+
+        plt.show()
 
 
-            ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4, color='#E50000', label='fraction closed particles (state C)')
-
-
-
-            ax_top.fill_between(time_array/60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1, label='flow on')
-
-            ax_top.set_ylabel('state fraction', color='black')
-            ax_top.set_ylim(0, 1.05)
-            ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-            # ax_top.legend(loc='upper left')
-            ax_top.grid(True)
-
-
-            ax_bot.semilogy(time_array/60, target_array, label='target', color='black')
-            ax_bot.set_ylabel('[T] (M)')
-            ax_bot.grid(True, axis='x', which='both')
-            ax_bot.set_yscale('log')
-            ax_bot.set_xlabel('time (minutes)')
-            ax_bot.set_xlim(time_array[0]/60, time_array[-1]/60)
-
-            plt.show()
-        if particle_selection == "identified":
-            fig, (ax_top, ax_mid, ax_bot) = plt.subplots(
-                3, 1, figsize=(14, 6),
-                sharex=True,
-                gridspec_kw={"height_ratios": [6, 2, 1], "hspace": 0.15}
-            )
-
-            ax_top.errorbar(vid_times, frac_bound, yerr=[bound_error_lower, bound_error_higher], fmt="o-", capsize=4,
-                            color='#E50000', label='fraction closed particles (state C)')
-
-            ax_top.fill_between(time_array / 60, -0.05, 1.05, where=flow_array == 1, color='blue', alpha=0.1,
-                                label='flow on')
-
-            ax_top.set_ylabel('state fraction', color='black')
-            ax_top.set_ylim(0, 1.05)
-            ax_top.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-            # ax_top.legend(loc='upper left')
-            ax_top.grid(True)
-
-            ax_mid.semilogy(time_array / 60, target_array, label='target', color='black')
-            ax_mid.set_ylabel('[T] (M)')
-            ax_mid.grid(True, axis='x', which='both')
-            ax_mid.set_yscale('log')
-            # ax_mid.set_xlabel('time (minutes)')
-            ax_mid.set_xlim(time_array[0] / 60, time_array[-1] / 60)
-
-            ax_bot.plot(vid_times, num_particles_identified, color = "black", label="number of particles")
-            # ax_bot.set_ylabel('number of particles', color='black', fontsize=10)
-            ax_bot.legend(loc='upper right', fontsize = 10)
-            ax_bot.set_xlabel('time (minutes)')
-            ax_bot.set_xlim(time_array[0] / 60, time_array[-1] / 60)
-
-
-def gen_target(steps: np.ndarray, duration: int, time_step: float):
+# target concentration
+def gen_target_or_flow(steps: np.ndarray, duration: int, time_step: float):
     target = np.zeros(len(np.arange(0,duration*60,time_step)))
 
     for s in steps:
@@ -2990,17 +3347,6 @@ def gen_target(steps: np.ndarray, duration: int, time_step: float):
 
     return target
 
-
-# mechanical actuation, i.e. forced vs unforced
-def gen_mode(steps: np.ndarray, duration: int, time_step: float):
-    mode = np.zeros(len(np.arange(0,duration*60,time_step)))
-
-    for s in steps:
-        start = int(round(60*s[0] / time_step))
-        stop = int(round(60*s[1] / time_step))
-        mode[start:stop] = 1
-
-    return mode
 
 
 def combine_particle_dataframes(dfs: List[pd.DataFrame]) -> pd.DataFrame:
@@ -3290,137 +3636,78 @@ def truncate_positions(df, vid_num, new_length: int):
     return df
 
 
-def plot_particle_state(particles_df, vid_num, image_path, box_pixel_len):
-
-    # image = tifffile.imread(image_path)[0, :, :]  # subset to first 10 for speed
-    #
-    # # Invert, subset first image, and compute image shape
-    # # Invert image
-    # image = ((2 ** 16 - 1) - image)
-    # image = image - np.min(image) + 1
-    #
-    # # Ensure we have a 3-channel image to draw colored boxes
-    # if image.ndim == 2:
-    #     ann = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)   # grayscale -> BGR
-    # else:
-    #     ann = image.copy()
+def plot_particle_state(particles_df, vid_num, image_path, box_pixel_len, plot_particle_number: bool = False):
+    # --- load first frame (uint16) ---
     img16 = tifffile.imread(image_path)[0].astype(np.uint16)
 
-    # invert and shift
+    # invert & shift to nonnegative
     img16 = (65535 - img16)
-    img16 = (img16 - img16.min())  # >= 0
+    img16 = img16 - img16.min()
 
-    # --- downscale to 8-bit for RGB plotting ---
-    # robust linear scaling 0..max -> 0..255
+    # downscale to 8-bit for annotation canvas
     den = int(img16.max()) or 1
     img8 = cv2.convertScaleAbs(img16, alpha=255.0 / den)  # uint8
+    if img8.ndim == 2:
+        ann = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)  # BGR canvas
+    else:
+        ann = img8.copy()
 
-    # color canvas to draw boxes (BGR)
-    ann = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+    # colors (BGR)
+    BLUE = (255, 0, 0)
+    RED = (0, 0, 255)
+    YELLOW = (0, 255, 255)
 
-    box = int(box_pixel_len)
+    # safe box half-size
+    half = int(max(1, round(float(box_pixel_len))))
 
-    # Colors in **BGR** (OpenCV): blue, yellow
-    BLUE   = (255,  0,  0)
-    RED    = (0,    0,  255)
-    YELLOW = (0,    255, 255)
+    # column names for this video
+    col_part = "Particle Number"
+    col_x = f"({vid_num}) mean x position"
+    col_y = f"({vid_num}) mean y position"
+    col_state = f"({vid_num}) state"
 
+    # verify columns exist
+    for c in (col_part, col_x, col_y, col_state):
+        if c not in particles_df.columns:
+            raise KeyError(f"Missing column: {c}")
 
-    col_part_num = particles_df.columns.get_loc("Particle Number")
-    col_x = particles_df.columns.get_loc(f"({vid_num}) mean x position")
-    col_y = particles_df.columns.get_loc(f"({vid_num}) mean y position")
-    col_state = particles_df.columns.get_loc(f"({vid_num}) state")
+    # pull needed data as numpy (fast)
+    vals = particles_df[[col_part, col_x, col_y, col_state]].to_numpy()
 
-    for i, row in enumerate(particles_df.itertuples(index=False, name=None)):
-        particle_number = row[col_part_num]
-        x = np.round(row[col_x])
-        y = np.round(row[col_y])
+    h, w = ann.shape[:2]
+    for particle_number, x, y, val in vals:
+        # skip rows with non-finite or missing coords
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
 
-        val = row[col_state]
-        if pd.isna(val):  # handles pd.NA, np.nan
-            state_color = YELLOW
-        elif bool(val):  # True branch
-            state_color = RED
-        else:  # False branch
-            state_color = BLUE
+        # choose color by state: NaN -> YELLOW, True -> RED, False -> BLUE
+        if pd.isna(val):
+            color = YELLOW
+        elif bool(val):
+            color = RED
+        else:
+            color = BLUE
 
+        # round and clip coordinates to image bounds
+        xi = int(np.clip(np.rint(x), 0, w - 1))
+        yi = int(np.clip(np.rint(y), 0, h - 1))
 
-        cv2.rectangle(ann, (int(x - box), int(y - box)), (int(x + box), int(y + box)), state_color, 2)
-        cv2.putText(ann, str(particle_number), (int(x), int(y + 18)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_color, 1, cv2.LINE_AA)
+        x0 = int(np.clip(xi - half, 0, w - 1))
+        y0 = int(np.clip(yi - half, 0, h - 1))
+        x1 = int(np.clip(xi + half, 0, w - 1))
+        y1 = int(np.clip(yi + half, 0, h - 1))
 
+        # draw
+        cv2.rectangle(ann, (x0, y0), (x1, y1), color, 2)
+        if plot_particle_number:
+            cv2.putText(ann, str(int(particle_number)), (xi, min(yi + 18, h - 1)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-
-
-
-    # Show: convert BGR -> RGB for matplotlib; don't use cmap here
-    plt.figure(figsize=(20, 20))
+    # show (convert BGR->RGB for matplotlib)
+    plt.figure(figsize=(12, 12))
     plt.imshow(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB))
     plt.axis('off')
     plt.show()
-
-    def plot_particle_state(particles_df, vid_num, image_path, box_pixel_len):
-
-        # image = tifffile.imread(image_path)[0, :, :]  # subset to first 10 for speed
-        #
-        # # Invert, subset first image, and compute image shape
-        # # Invert image
-        # image = ((2 ** 16 - 1) - image)
-        # image = image - np.min(image) + 1
-        #
-        # # Ensure we have a 3-channel image to draw colored boxes
-        # if image.ndim == 2:
-        #     ann = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)   # grayscale -> BGR
-        # else:
-        #     ann = image.copy()
-        img16 = tifffile.imread(image_path)[0].astype(np.uint16)
-
-        # invert and shift
-        img16 = (65535 - img16)
-        img16 = (img16 - img16.min())  # >= 0
-
-        # --- downscale to 8-bit for RGB plotting ---
-        # robust linear scaling 0..max -> 0..255
-        den = int(img16.max()) or 1
-        img8 = cv2.convertScaleAbs(img16, alpha=255.0 / den)  # uint8
-
-        # color canvas to draw boxes (BGR)
-        ann = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
-
-        box = int(box_pixel_len)
-
-        # Colors in **BGR** (OpenCV): blue, yellow
-        BLUE = (255, 0, 0)
-        RED = (0, 0, 255)
-        YELLOW = (0, 255, 255)
-
-        col_part_num = particles_df.columns.get_loc("Particle Number")
-        col_x = particles_df.columns.get_loc(f"({vid_num}) mean x position")
-        col_y = particles_df.columns.get_loc(f"({vid_num}) mean y position")
-        col_state = particles_df.columns.get_loc(f"({vid_num}) state")
-
-        for i, row in enumerate(particles_df.itertuples(index=False, name=None)):
-            particle_number = row[col_part_num]
-            x = np.round(row[col_x])
-            y = np.round(row[col_y])
-
-            val = row[col_state]
-            if pd.isna(val):  # handles pd.NA, np.nan
-                state_color = YELLOW
-            elif bool(val):  # True branch
-                state_color = RED
-            else:  # False branch
-                state_color = BLUE
-
-            cv2.rectangle(ann, (int(x - box), int(y - box)), (int(x + box), int(y + box)), state_color, 2)
-            cv2.putText(ann, str(particle_number), (int(x), int(y + 18)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_color, 1, cv2.LINE_AA)
-
-        # Show: convert BGR -> RGB for matplotlib; don't use cmap here
-        plt.figure(figsize=(20, 20))
-        plt.imshow(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB))
-        plt.axis('off')
-        plt.show()
 
 
 
